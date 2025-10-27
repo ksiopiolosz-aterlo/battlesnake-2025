@@ -1,0 +1,1 @@
+echo "$ANTHROPIC_API_KEY"
