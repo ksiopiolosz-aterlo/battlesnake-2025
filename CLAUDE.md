@@ -975,7 +975,7 @@ fn index_to_direction(idx: u8) -> String {
 ## Our Snake (in order of importance)
 
 1. **Survival** (highest priority)
-   - MUST avoid walls and snake collisions
+   - MUST avoid walls and snake collisions with length greater than or equal to our own
    - Defensively maneuver to evade threats
 
 2. **Food acquisition**

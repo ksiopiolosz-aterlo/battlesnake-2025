@@ -571,8 +571,12 @@ impl Bot {
     }
 
     /// Checks if moving to a position could result in a dangerous head-to-head collision
-    /// Returns true if any opponent snake head is adjacent and could collide with us,
+    /// Returns true if any opponent snake could also move to the same position,
     /// AND that opponent is equal or longer length (meaning we would lose or tie)
+    ///
+    /// This handles two scenarios:
+    /// 1. Direct collision: both snakes move to the exact same cell (e.g., converging on food)
+    /// 2. Adjacent threat: opponent head is adjacent to our target position and could move there
     fn is_dangerous_head_to_head(position: &Coord, our_snake: &Battlesnake, board: &Board) -> bool {
         for opponent in &board.snakes {
             // Skip ourselves and dead snakes
@@ -582,15 +586,34 @@ impl Bot {
 
             let opp_head = opponent.body[0];
 
-            // Check if opponent head is adjacent to our target position
-            // Adjacent means Manhattan distance of 1
-            let distance = Self::manhattan_distance(*position, opp_head);
+            // Get opponent's neck to avoid considering reverse moves
+            let opp_neck = if opponent.body.len() > 1 {
+                Some(opponent.body[1])
+            } else {
+                None
+            };
 
-            if distance == 1 {
-                // Opponent is adjacent and could move to collide with us
-                // This is dangerous if they're equal or longer length
-                if opponent.length >= our_snake.length {
-                    return true;
+            // Check if opponent could also move to the exact same target position
+            // This is the key check for converging collisions (e.g., both going for food)
+            for dir in Direction::all() {
+                let opp_next = dir.apply(&opp_head);
+
+                // Skip if opponent would be reversing onto their neck
+                if let Some(neck) = opp_neck {
+                    if opp_next == neck {
+                        continue;
+                    }
+                }
+
+                // If opponent could move to the same position as us
+                if opp_next == *position {
+                    // This is dangerous if they're equal or longer length
+                    // Equal length: both die (bad for us)
+                    // Longer: we die (bad for us)
+                    // Only safe if we're strictly longer
+                    if opponent.length >= our_snake.length {
+                        return true;
+                    }
                 }
             }
         }
@@ -1060,9 +1083,23 @@ impl Bot {
 
             let opp_head = opponent.body[0];
 
+            // Get opponent's neck to avoid considering reverse moves
+            let opp_neck = if opponent.body.len() > 1 {
+                Some(opponent.body[1])
+            } else {
+                None
+            };
+
             // For each possible opponent move, check if they could reach our position
             for dir in Direction::all() {
                 let opp_next_pos = dir.apply(&opp_head);
+
+                // Skip if opponent would be reversing onto their neck
+                if let Some(neck) = opp_neck {
+                    if opp_next_pos == neck {
+                        continue;
+                    }
+                }
 
                 // If opponent could move to the same position as us
                 if opp_next_pos == position {
