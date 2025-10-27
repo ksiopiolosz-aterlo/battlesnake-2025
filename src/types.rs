@@ -43,6 +43,42 @@ pub struct Coord {
     pub y: i32,
 }
 
+/// Represents the four possible movement directions for a Battlesnake
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Direction {
+    /// Returns all possible directions
+    pub fn all() -> [Direction; 4] {
+        [Direction::Up, Direction::Down, Direction::Left, Direction::Right]
+    }
+
+    /// Converts direction to string representation for API response
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+            Direction::Left => "left",
+            Direction::Right => "right",
+        }
+    }
+
+    /// Calculates the next coordinate when moving in this direction
+    pub fn apply(&self, coord: &Coord) -> Coord {
+        match self {
+            Direction::Up => Coord { x: coord.x, y: coord.y + 1 },
+            Direction::Down => Coord { x: coord.x, y: coord.y - 1 },
+            Direction::Left => Coord { x: coord.x - 1, y: coord.y },
+            Direction::Right => Coord { x: coord.x + 1, y: coord.y },
+        }
+    }
+}
+
 /// Complete game state received from the API
 #[derive(Deserialize, Serialize, Debug)]
 pub struct GameState {

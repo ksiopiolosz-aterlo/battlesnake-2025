@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use crate::config::Config;
-use crate::types::{Battlesnake, Board, Coord, Game};
+use crate::types::{Battlesnake, Board, Coord, Direction, Game};
 
 /// Battlesnake Bot with OOP-style API
 /// Takes static configuration dependencies and exposes methods corresponding to API endpoints
@@ -71,92 +71,61 @@ impl Bot {
     /// # Returns
     /// * `Value` - JSON response containing the chosen move direction
     pub fn get_move(&self, _game: &Game, turn: &i32, board: &Board, you: &Battlesnake) -> Value {
-        let mut is_move_safe: HashMap<_, _> = vec![
-            ("up", true),
-            ("down", true),
-            ("left", true),
-            ("right", true),
-        ]
-        .into_iter()
-        .collect();
+        let safe_moves: Vec<Direction> = self
+            .get_safe_moves(board, you)
+            .into_iter()
+            .filter(|&(_, v)| v)
+            .map(|(k, _)| k)
+            .collect();
 
-        // We've included code to prevent your Battlesnake from moving backwards
+        // Choose a random move from the safe ones
+        // If no safe moves exist, pick any move (we're likely going to die anyway)
+        let chosen = if safe_moves.is_empty() {
+            info!("WARNING: No safe moves available, choosing default move");
+            Direction::Up
+        } else {
+            *safe_moves.choose(&mut rand::rng()).unwrap()
+        };
+
+        // TODO: Step 4 - Move towards food instead of random, to regain health and survive longer
+        // let food = &board.food;
+
+        info!("MOVE {}: {}", turn, chosen.as_str());
+        json!({ "move": chosen.as_str() })
+    }
+
+    /// Computes a HashMap of moves marking each as safe or unsafe
+    ///
+    /// # Arguments
+    /// * `board` - Current board state
+    /// * `you` - Your snake's current state
+    ///
+    /// # Returns
+    /// * `HashMap<Direction, bool>` - Map of all directions with safety status
+    fn get_safe_moves(&self, board: &Board, you: &Battlesnake) -> HashMap<Direction, bool> {
+        // Initialize all moves as safe
+        let mut is_move_safe: HashMap<Direction, bool> =
+            Direction::all().iter().map(|&dir| (dir, true)).collect();
+
         let my_head = &you.body[0]; // Coordinates of your head
-
-        // Only check neck if snake has more than minimum body length
-        if you.body.len() > self.config.move_generation.snake_min_body_length_for_neck {
-            let my_neck = &you.body[1]; // Coordinates of your "neck"
-
-            if my_neck.x < my_head.x {
-                // Neck is left of head, don't move left
-                is_move_safe.insert("left", false);
-            } else if my_neck.x > my_head.x {
-                // Neck is right of head, don't move right
-                is_move_safe.insert("right", false);
-            } else if my_neck.y < my_head.y {
-                // Neck is below head, don't move down
-                is_move_safe.insert("down", false);
-            } else if my_neck.y > my_head.y {
-                // Neck is above head, don't move up
-                is_move_safe.insert("up", false);
-            }
-        }
-
-        // Step 1: Prevent your Battlesnake from moving out of bounds
-        let board_width = board.width;
-        let board_height = board.height;
-
-        // Calculate potential next positions for each direction
-        let move_up = Coord {
-            x: my_head.x,
-            y: my_head.y + 1,
-        };
-        let move_down = Coord {
-            x: my_head.x,
-            y: my_head.y - 1,
-        };
-        let move_left = Coord {
-            x: my_head.x - 1,
-            y: my_head.y,
-        };
-        let move_right = Coord {
-            x: my_head.x + 1,
-            y: my_head.y,
-        };
-
-        // Check boundary collisions
-        if Self::is_out_of_bounds(&move_up, board_width, board_height) {
-            is_move_safe.insert("up", false);
-        }
-        if Self::is_out_of_bounds(&move_down, board_width, board_height) {
-            is_move_safe.insert("down", false);
-        }
-        if Self::is_out_of_bounds(&move_left, board_width, board_height) {
-            is_move_safe.insert("left", false);
-        }
-        if Self::is_out_of_bounds(&move_right, board_width, board_height) {
-            is_move_safe.insert("right", false);
-        }
-
-        // Step 2: Prevent your Battlesnake from colliding with itself
         let my_body = &you.body;
         let body_tail_offset = self.config.move_generation.body_tail_offset;
 
-        if Self::is_self_collision(&move_up, my_body, body_tail_offset) {
-            is_move_safe.insert("up", false);
-        }
-        if Self::is_self_collision(&move_down, my_body, body_tail_offset) {
-            is_move_safe.insert("down", false);
-        }
-        if Self::is_self_collision(&move_left, my_body, body_tail_offset) {
-            is_move_safe.insert("left", false);
-        }
-        if Self::is_self_collision(&move_right, my_body, body_tail_offset) {
-            is_move_safe.insert("right", false);
-        }
+        // Prevent moving backwards into neck
+        Self::avoid_neck_moves(
+            &mut is_move_safe,
+            my_head,
+            my_body,
+            self.config.move_generation.snake_min_body_length_for_neck,
+        );
 
-        // Step 3: Prevent your Battlesnake from colliding with other Battlesnakes
-        // Filter to get only opponents (not our own snake)
+        // Step 1: Prevent moving out of bounds
+        Self::avoid_boundary_collisions(&mut is_move_safe, my_head, board.width, board.height);
+
+        // Step 2: Prevent colliding with own body
+        Self::avoid_self_collisions(&mut is_move_safe, my_head, my_body, body_tail_offset);
+
+        // Step 3: Prevent colliding with other snakes
         let opponents: Vec<Battlesnake> = board
             .snakes
             .iter()
@@ -164,34 +133,83 @@ impl Bot {
             .cloned()
             .collect();
 
-        if Self::is_opponent_collision(&move_up, &opponents, body_tail_offset) {
-            is_move_safe.insert("up", false);
-        }
-        if Self::is_opponent_collision(&move_down, &opponents, body_tail_offset) {
-            is_move_safe.insert("down", false);
-        }
-        if Self::is_opponent_collision(&move_left, &opponents, body_tail_offset) {
-            is_move_safe.insert("left", false);
-        }
-        if Self::is_opponent_collision(&move_right, &opponents, body_tail_offset) {
-            is_move_safe.insert("right", false);
+        Self::avoid_opponent_collisions(&mut is_move_safe, my_head, &opponents, body_tail_offset);
+
+        is_move_safe
+    }
+
+    /// Marks moves that would cause the snake to move backwards into its own neck as unsafe
+    fn avoid_neck_moves(
+        is_move_safe: &mut HashMap<Direction, bool>,
+        my_head: &Coord,
+        my_body: &[Coord],
+        min_body_length: usize,
+    ) {
+        // Only check neck if snake has more than minimum body length
+        if my_body.len() <= min_body_length {
+            return;
         }
 
-        // Are there any safe moves left?
-        let safe_moves = is_move_safe
-            .into_iter()
-            .filter(|&(_, v)| v)
-            .map(|(k, _)| k)
-            .collect::<Vec<_>>();
+        let my_neck = &my_body[1]; // Coordinates of the "neck"
 
-        // Choose a random move from the safe ones
-        let chosen = safe_moves.choose(&mut rand::rng()).unwrap();
+        if my_neck.x < my_head.x {
+            // Neck is left of head, don't move left
+            is_move_safe.insert(Direction::Left, false);
+        } else if my_neck.x > my_head.x {
+            // Neck is right of head, don't move right
+            is_move_safe.insert(Direction::Right, false);
+        } else if my_neck.y < my_head.y {
+            // Neck is below head, don't move down
+            is_move_safe.insert(Direction::Down, false);
+        } else if my_neck.y > my_head.y {
+            // Neck is above head, don't move up
+            is_move_safe.insert(Direction::Up, false);
+        }
+    }
 
-        // TODO: Step 4 - Move towards food instead of random, to regain health and survive longer
-        // let food = &board.food;
+    /// Marks moves that would cause the snake to move out of bounds as unsafe
+    fn avoid_boundary_collisions(
+        is_move_safe: &mut HashMap<Direction, bool>,
+        my_head: &Coord,
+        board_width: i32,
+        board_height: u32,
+    ) {
+        for direction in Direction::all() {
+            let next_pos = direction.apply(my_head);
+            if Self::is_out_of_bounds(&next_pos, board_width, board_height) {
+                is_move_safe.insert(direction, false);
+            }
+        }
+    }
 
-        info!("MOVE {}: {}", turn, chosen);
-        json!({ "move": chosen })
+    /// Marks moves that would cause the snake to collide with itself as unsafe
+    fn avoid_self_collisions(
+        is_move_safe: &mut HashMap<Direction, bool>,
+        my_head: &Coord,
+        my_body: &[Coord],
+        body_tail_offset: usize,
+    ) {
+        for direction in Direction::all() {
+            let next_pos = direction.apply(my_head);
+            if Self::is_self_collision(&next_pos, my_body, body_tail_offset) {
+                is_move_safe.insert(direction, false);
+            }
+        }
+    }
+
+    /// Marks moves that would cause the snake to collide with opponents as unsafe
+    fn avoid_opponent_collisions(
+        is_move_safe: &mut HashMap<Direction, bool>,
+        my_head: &Coord,
+        opponents: &[Battlesnake],
+        body_tail_offset: usize,
+    ) {
+        for direction in Direction::all() {
+            let next_pos = direction.apply(my_head);
+            if Self::is_opponent_collision(&next_pos, opponents, body_tail_offset) {
+                is_move_safe.insert(direction, false);
+            }
+        }
     }
 
     /// Checks if a coordinate is out of bounds

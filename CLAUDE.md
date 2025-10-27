@@ -993,3 +993,6 @@ Assume opponents prioritize:
 1. Survival (avoid walls and our snake)
 2. Attacking us (trap or collision attempts)
 3. Food acquisition
+
+## Compilation
+Please ensure all code changes are saved before attempting to compile. Unless otherwise stated, you should not attempt to compile via cargo and instead advise the user to do it
