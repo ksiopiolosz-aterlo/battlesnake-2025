@@ -40,10 +40,10 @@ impl Bot {
 
         json!({
             "apiversion": "1",
-            "author": "", // TODO: Your Battlesnake Username
-            "color": "#888888", // TODO: Choose color
-            "head": "default", // TODO: Choose head
-            "tail": "default", // TODO: Choose tail
+            "author": "ksiopiolosz-aterlo",
+            "color": "#00DEAD",
+            "head": "default",
+            "tail": "default",
         })
     }
 
