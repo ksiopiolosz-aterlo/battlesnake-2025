@@ -11,13 +11,36 @@
 // For more info see docs.battlesnake.com
 
 use log::info;
+use rayon::prelude::*;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::types::{Battlesnake, Board, Coord, Direction, Game};
+
+/// N-tuple score representation for MaxN algorithm
+/// Each component represents the utility score for one player
+#[derive(Debug, Clone)]
+struct ScoreTuple {
+    scores: Vec<i32>,
+}
+
+impl ScoreTuple {
+    /// Creates a new score tuple with specified size and initial value
+    fn new_with_value(num_players: usize, initial_value: i32) -> Self {
+        ScoreTuple {
+            scores: vec![initial_value; num_players],
+        }
+    }
+
+    /// Gets the score for a specific player
+    fn for_player(&self, player_idx: usize) -> i32 {
+        self.scores.get(player_idx).copied().unwrap_or(i32::MIN)
+    }
+}
 
 /// Execution strategy based on game state and hardware
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +317,14 @@ impl Bot {
             config.time_estimation.model_weight,
         );
 
+        // Select search function based on strategy (constant for entire game)
+        // This hoists the match outside the iterative deepening loop to save cycles
+        let search_fn: fn(&Board, &Battlesnake, u8, &Arc<SharedSearchState>, &Config) = match strategy {
+            ExecutionStrategy::Parallel1v1 => Self::parallel_1v1_search,
+            ExecutionStrategy::ParallelMultiplayer => Self::parallel_multiplayer_search,
+            ExecutionStrategy::Sequential => Self::sequential_search,
+        };
+
         // Iterative deepening loop
         let mut current_depth = config.timing.initial_depth;
         let effective_budget = config.timing.effective_budget_ms();
@@ -334,22 +365,8 @@ impl Bot {
             // Record iteration start time
             let iteration_start = Instant::now();
 
-            // Execute search based on strategy
-            match strategy {
-                ExecutionStrategy::Parallel1v1 => {
-                    info!(
-                        "TODO: parallel_1v1_search not yet implemented, using sequential fallback"
-                    );
-                    Self::sequential_search(board, you, current_depth, &shared, config);
-                }
-                ExecutionStrategy::ParallelMultiplayer => {
-                    info!("TODO: parallel_multiplayer_search not yet implemented, using sequential fallback");
-                    Self::sequential_search(board, you, current_depth, &shared, config);
-                }
-                ExecutionStrategy::Sequential => {
-                    Self::sequential_search(board, you, current_depth, &shared, config);
-                }
-            }
+            // Execute search using pre-selected function pointer
+            search_fn(board, you, current_depth, &shared, config);
 
             // Record actual iteration time
             let iteration_elapsed = iteration_start.elapsed().as_millis() as f64;
@@ -395,7 +412,7 @@ impl Bot {
     fn sequential_search(
         board: &Board,
         you: &Battlesnake,
-        _depth: u8,
+        depth: u8,
         shared: &Arc<SharedSearchState>,
         config: &Config,
     ) {
@@ -412,17 +429,60 @@ impl Bot {
             return;
         }
 
-        info!("Evaluating {} legal moves", legal_moves.len());
+        info!("Evaluating {} legal moves sequentially", legal_moves.len());
 
-        // For now, use simple heuristic: move towards closest food
-        // TODO: Replace with actual MaxN search
-        let chosen_move = Self::choose_move_towards_food(board, you, &legal_moves);
+        // Determine if we should use 1v1 alpha-beta or multiplayer MaxN
+        let num_alive = board.snakes.iter().filter(|s| s.health > 0).count();
+        let use_alpha_beta = num_alive == config.strategy.min_snakes_for_1v1;
 
-        let move_idx = Self::direction_to_index(chosen_move, config);
-        let score = 1000; // Placeholder score
+        let our_snake_id = &you.id;
+        let our_idx = board
+            .snakes
+            .iter()
+            .position(|s| &s.id == our_snake_id)
+            .unwrap_or(0);
 
-        shared.best_move.store(move_idx, Ordering::Release);
-        shared.best_score.store(score, Ordering::Release);
+        let mut best_score = i32::MIN;
+
+        for &mv in legal_moves.iter() {
+            let mut child_board = board.clone();
+            Self::apply_move(&mut child_board, our_idx, mv, config);
+
+            let score = if use_alpha_beta {
+                // Use alpha-beta for 1v1
+                Self::alpha_beta_minimax(
+                    &child_board,
+                    our_snake_id,
+                    depth.saturating_sub(1),
+                    i32::MIN,
+                    i32::MAX,
+                    false,
+                    config,
+                )
+            } else {
+                // Use MaxN for multiplayer
+                let tuple = Self::maxn_search(
+                    &child_board,
+                    our_snake_id,
+                    depth.saturating_sub(1),
+                    our_idx,
+                    config,
+                );
+                tuple.for_player(our_idx)
+            };
+
+            if score > best_score {
+                best_score = score;
+
+                // Immediate update (anytime property)
+                shared
+                    .best_move
+                    .store(Self::direction_to_index(mv, config), Ordering::Release);
+                shared.best_score.store(best_score, Ordering::Release);
+            }
+        }
+
+        info!("Sequential search complete: best score = {}", best_score);
     }
 
     /// Generates all legal moves for a snake
@@ -490,38 +550,6 @@ impl Bot {
         false
     }
 
-    /// Simple heuristic: choose move that gets us closer to nearest food
-    /// This is a placeholder until full MaxN search is implemented
-    fn choose_move_towards_food(
-        board: &Board,
-        you: &Battlesnake,
-        legal_moves: &[Direction],
-    ) -> Direction {
-        if board.food.is_empty() || legal_moves.is_empty() {
-            return legal_moves[0];
-        }
-
-        let head = you.body[0];
-
-        // Find closest food
-        let closest_food = board
-            .food
-            .iter()
-            .min_by_key(|&&food| Self::manhattan_distance(head, food))
-            .copied()
-            .unwrap();
-
-        // Choose move that minimizes distance to closest food
-        legal_moves
-            .iter()
-            .min_by_key(|&&dir| {
-                let next = dir.apply(&head);
-                Self::manhattan_distance(next, closest_food)
-            })
-            .copied()
-            .unwrap_or(legal_moves[0])
-    }
-
     /// Calculates Manhattan distance between two coordinates
     fn manhattan_distance(a: Coord, b: Coord) -> i32 {
         (a.x - b.x).abs() + (a.y - b.y).abs()
@@ -550,5 +578,859 @@ impl Bot {
         } else {
             Direction::Up // Default fallback
         }
+    }
+
+    /// Applies a move to a specific snake in the game state
+    /// Updates snake position, handles food consumption, and decreases health
+    fn apply_move(board: &mut Board, snake_idx: usize, dir: Direction, config: &Config) {
+        if snake_idx >= board.snakes.len() {
+            return;
+        }
+
+        let snake = &mut board.snakes[snake_idx];
+        if snake.health <= 0 || snake.body.is_empty() {
+            return;
+        }
+
+        // Calculate new head position
+        let new_head = dir.apply(&snake.body[0]);
+
+        // Move head to new position
+        snake.body.insert(0, new_head);
+        snake.head = new_head;
+
+        // Check if food was eaten
+        let ate_food = board.food.contains(&new_head);
+        if ate_food {
+            // Remove food from board
+            board.food.retain(|&f| f != new_head);
+            // Restore health
+            snake.health = config.game_rules.health_on_food as i32;
+            // Grow snake (don't remove tail)
+            snake.length += 1;
+        } else {
+            // Remove tail (snake doesn't grow)
+            snake.body.pop();
+            // Decrease health
+            snake.health = snake.health.saturating_sub(config.game_rules.health_loss_per_turn as i32);
+        }
+
+        // Mark snake as dead if health reaches zero
+        if snake.health <= 0 {
+            snake.health = 0;
+        }
+    }
+
+    /// Advances the game state by one turn after all snakes have moved
+    /// Handles head-to-head collisions and body collisions
+    fn advance_game_state(board: &mut Board) {
+        // Detect head-to-head collisions
+        let mut head_positions: HashMap<Coord, Vec<usize>> = HashMap::new();
+
+        for (idx, snake) in board.snakes.iter().enumerate() {
+            if snake.health > 0 && !snake.body.is_empty() {
+                head_positions
+                    .entry(snake.body[0])
+                    .or_insert_with(Vec::new)
+                    .push(idx);
+            }
+        }
+
+        // Process head-to-head collisions
+        for (_, indices) in head_positions.iter() {
+            if indices.len() > 1 {
+                // Multiple snakes at same position
+                let max_length = indices
+                    .iter()
+                    .map(|&i| board.snakes[i].length)
+                    .max()
+                    .unwrap_or(0);
+
+                // Count how many snakes have max length
+                let max_count = indices
+                    .iter()
+                    .filter(|&&i| board.snakes[i].length == max_length)
+                    .count();
+
+                // Kill snakes based on length comparison
+                for &idx in indices {
+                    if board.snakes[idx].length < max_length {
+                        // Shorter snake dies
+                        board.snakes[idx].health = 0;
+                    } else if max_count > 1 {
+                        // Equal length: all die
+                        board.snakes[idx].health = 0;
+                    }
+                }
+            }
+        }
+
+        // Check for body collisions (snake head hitting any body segment)
+        let mut collision_snakes = Vec::new();
+        for (idx, snake) in board.snakes.iter().enumerate() {
+            if snake.health <= 0 {
+                continue;
+            }
+
+            let head = snake.body[0];
+
+            // Check collision with all snake bodies (including own)
+            for (other_idx, other_snake) in board.snakes.iter().enumerate() {
+                if other_snake.health <= 0 {
+                    continue;
+                }
+
+                // Check against body segments (excluding the tail which just moved)
+                let check_len = if idx == other_idx {
+                    // Own body: check all except head and tail
+                    if other_snake.body.len() > 2 {
+                        other_snake.body.len() - 1
+                    } else {
+                        0
+                    }
+                } else {
+                    // Other snake: check all except tail
+                    other_snake.body.len().saturating_sub(1)
+                };
+
+                if other_snake.body[1..check_len.min(other_snake.body.len())]
+                    .contains(&head)
+                {
+                    collision_snakes.push(idx);
+                    break;
+                }
+            }
+        }
+
+        // Mark collided snakes as dead
+        for idx in collision_snakes {
+            board.snakes[idx].health = 0;
+        }
+    }
+
+    /// Checks if the game state is terminal (game over)
+    fn is_terminal(board: &Board, our_snake_id: &str, config: &Config) -> bool {
+        let alive_count = board.snakes.iter().filter(|s| s.health > 0).count();
+
+        // Terminal if only one or zero snakes alive
+        if alive_count <= config.game_rules.terminal_state_threshold {
+            return true;
+        }
+
+        // Terminal if our snake is dead
+        if let Some(our_snake) = board.snakes.iter().find(|s| s.id == our_snake_id) {
+            if our_snake.health <= 0 {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Flood fill BFS to count reachable cells from a starting position
+    /// Accounts for snake bodies that will move over time
+    /// Returns the number of cells reachable
+    fn flood_fill_bfs(board: &Board, start: Coord, snake_idx: usize) -> usize {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        queue.push_back((start, 0)); // (position, turns_elapsed)
+        visited.insert(start);
+
+        while let Some((pos, turns)) = queue.pop_front() {
+            for dir in Direction::all().iter() {
+                let next = dir.apply(&pos);
+
+                // Check bounds
+                if next.x < 0
+                    || next.x >= board.width
+                    || next.y < 0
+                    || next.y >= board.height as i32
+                {
+                    continue;
+                }
+
+                if visited.contains(&next) {
+                    continue;
+                }
+
+                // Check if blocked (accounting for bodies that will move)
+                if Self::is_position_blocked_at_time(board, next, turns, snake_idx) {
+                    continue;
+                }
+
+                visited.insert(next);
+                queue.push_back((next, turns + 1));
+            }
+        }
+
+        visited.len()
+    }
+
+    /// Checks if a position will be blocked at a future turn
+    /// Accounts for snake body segments moving away over time
+    fn is_position_blocked_at_time(
+        board: &Board,
+        pos: Coord,
+        turns_future: usize,
+        _checking_snake: usize,
+    ) -> bool {
+        for snake in &board.snakes {
+            if snake.health <= 0 {
+                continue;
+            }
+
+            for (seg_idx, &segment) in snake.body.iter().enumerate() {
+                if segment == pos {
+                    // Will this segment have moved away?
+                    let segments_from_tail = snake.body.len() - seg_idx;
+                    if segments_from_tail > turns_future {
+                        return true; // Still occupied
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Adversarial flood fill - simultaneous BFS from all snake heads
+    /// Returns map of which snake controls each cell (longer snakes win ties)
+    fn adversarial_flood_fill(board: &Board) -> HashMap<Coord, usize> {
+        let mut control_map: HashMap<Coord, usize> = HashMap::new();
+        let mut distance_map: HashMap<Coord, usize> = HashMap::new();
+
+        // Mark snake bodies as obstacles controlled by their owner
+        for (idx, snake) in board.snakes.iter().enumerate() {
+            if snake.health <= 0 {
+                continue;
+            }
+            for &seg in &snake.body {
+                control_map.insert(seg, idx);
+            }
+        }
+
+        // Sort snakes by length (longer snakes win ties)
+        let mut snakes_sorted: Vec<(usize, &Battlesnake)> =
+            board.snakes.iter().enumerate().collect();
+        snakes_sorted.sort_by_key(|(_, s)| std::cmp::Reverse(s.length));
+
+        // Simultaneous BFS from all heads
+        let mut queue = VecDeque::new();
+        for (idx, snake) in snakes_sorted.iter() {
+            if snake.health > 0 && !snake.body.is_empty() {
+                queue.push_back((snake.body[0], *idx, 0));
+                distance_map.insert(snake.body[0], 0);
+            }
+        }
+
+        while let Some((pos, owner, dist)) = queue.pop_front() {
+            // Skip if already claimed by another snake at same or closer distance
+            if let Some(&existing_dist) = distance_map.get(&pos) {
+                if existing_dist < dist {
+                    continue;
+                }
+            }
+
+            // Claim cell if not already controlled
+            control_map.entry(pos).or_insert(owner);
+
+            for dir in Direction::all().iter() {
+                let next = dir.apply(&pos);
+
+                if next.x < 0
+                    || next.x >= board.width
+                    || next.y < 0
+                    || next.y >= board.height as i32
+                {
+                    continue;
+                }
+
+                let next_dist = dist + 1;
+
+                // Only explore if we can reach it faster or at same distance
+                let should_explore = match distance_map.get(&next) {
+                    Some(&existing_dist) => next_dist <= existing_dist,
+                    None => true,
+                };
+
+                if should_explore && !control_map.contains_key(&next) {
+                    distance_map.insert(next, next_dist);
+                    queue.push_back((next, owner, next_dist));
+                }
+            }
+        }
+
+        control_map
+    }
+
+    /// Computes health and food score for a snake
+    /// Returns higher score for closer food when health is low
+    fn compute_health_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return config.scores.score_zero_health;
+        }
+
+        let snake = &board.snakes[snake_idx];
+        if snake.health <= 0 {
+            return config.scores.score_zero_health;
+        }
+
+        if board.food.is_empty() {
+            // No food available - penalty based on remaining health
+            let health_ratio = snake.health as f32 / config.scores.health_max;
+            return (health_ratio * config.scores.score_zero_health as f32) as i32;
+        }
+
+        let head = snake.body[0];
+
+        // Find nearest food
+        let nearest_food_dist = board
+            .food
+            .iter()
+            .map(|&food| Self::manhattan_distance(head, food))
+            .min()
+            .unwrap_or(config.scores.default_food_distance);
+
+        // Urgency increases as health decreases
+        let urgency = (config.scores.health_max - snake.health as f32) / config.scores.health_max;
+        let distance_penalty = -(nearest_food_dist as f32 * urgency) as i32;
+
+        // Critical: will starve before reaching food
+        if snake.health <= nearest_food_dist {
+            return config.scores.score_starvation_base + distance_penalty;
+        }
+
+        distance_penalty
+    }
+
+    /// Computes space control score - how many cells are reachable
+    /// Penalizes cramped positions that could lead to being trapped
+    fn compute_space_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return -(config.scores.space_safety_margin as i32)
+                * config.scores.space_shortage_penalty;
+        }
+
+        let snake = &board.snakes[snake_idx];
+        if snake.health <= 0 || snake.body.is_empty() {
+            return -(config.scores.space_safety_margin as i32)
+                * config.scores.space_shortage_penalty;
+        }
+
+        let reachable = Self::flood_fill_bfs(board, snake.body[0], snake_idx);
+        let required = snake.length as usize + config.scores.space_safety_margin;
+
+        if reachable < required {
+            return -((required as i32 - reachable as i32) * config.scores.space_shortage_penalty);
+        }
+
+        reachable as i32
+    }
+
+    /// Computes territory control score - percentage of free cells controlled
+    /// Uses adversarial flood fill to determine territory ownership
+    fn compute_control_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let control_map = Self::adversarial_flood_fill(board);
+
+        let our_cells = control_map
+            .values()
+            .filter(|&&owner| owner == snake_idx)
+            .count();
+        let total_free = control_map.len();
+
+        if total_free == 0 {
+            return 0;
+        }
+
+        ((our_cells as f32 / total_free as f32) * config.scores.territory_scale_factor) as i32
+    }
+
+    /// Computes attack potential score
+    /// Awards points for length advantage near opponents and trapping opponents
+    fn compute_attack_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let our_snake = &board.snakes[snake_idx];
+        if our_snake.health <= 0 || our_snake.body.is_empty() {
+            return 0;
+        }
+
+        let our_head = our_snake.body[0];
+        let mut attack = 0i32;
+
+        for (idx, opponent) in board.snakes.iter().enumerate() {
+            if idx == snake_idx || opponent.health <= 0 || opponent.body.is_empty() {
+                continue;
+            }
+
+            // Head-to-head advantage if longer
+            if our_snake.length > opponent.length {
+                let dist = Self::manhattan_distance(our_head, opponent.body[0]);
+                if dist <= config.scores.attack_head_to_head_distance {
+                    attack += config.scores.attack_head_to_head_bonus;
+                }
+            }
+
+            // Trap potential - opponent has limited space
+            let opp_space = Self::flood_fill_bfs(board, opponent.body[0], idx);
+            if opp_space < opponent.length as usize + config.scores.attack_trap_margin {
+                attack += config.scores.attack_trap_bonus;
+            }
+        }
+
+        attack
+    }
+
+    /// Evaluates the current game state for all snakes
+    /// Returns an N-tuple of scores (one per snake)
+    fn evaluate_state(
+        board: &Board,
+        our_snake_id: &str,
+        config: &Config,
+    ) -> ScoreTuple {
+        let num_snakes = board.snakes.len();
+        let mut scores = vec![0i32; num_snakes];
+
+        for (idx, snake) in board.snakes.iter().enumerate() {
+            if snake.health <= 0 {
+                scores[idx] = config.scores.score_dead_snake;
+                continue;
+            }
+
+            // Multi-component evaluation
+            let survival = 0; // Alive = 0 penalty
+            let health = Self::compute_health_score(board, idx, config);
+            let space = Self::compute_space_score(board, idx, config);
+            let control = Self::compute_control_score(board, idx, config);
+            let length = snake.length * config.scores.weight_length;
+            let attack = Self::compute_attack_score(board, idx, config);
+
+            // Weighted combination
+            scores[idx] = survival
+                + (config.scores.score_survival_weight * survival as f32) as i32
+                + (config.scores.weight_space * space as f32) as i32
+                + (config.scores.weight_health * health as f32) as i32
+                + (config.scores.weight_control * control as f32) as i32
+                + (config.scores.weight_attack * attack as f32) as i32
+                + length;
+        }
+
+        // Apply survival penalty if our snake is dead
+        if let Some(our_idx) = board.snakes.iter().position(|s| s.id == our_snake_id) {
+            if board.snakes[our_idx].health <= 0 {
+                scores[our_idx] = config.scores.score_survival_penalty;
+            }
+        }
+
+        ScoreTuple { scores }
+    }
+
+    /// Determines which snakes are active (local) for IDAPOS optimization
+    /// Returns indices of snakes within locality distance
+    fn determine_active_snakes(
+        board: &Board,
+        our_snake_id: &str,
+        remaining_depth: u8,
+        config: &Config,
+    ) -> Vec<usize> {
+        let our_idx = match board.snakes.iter().position(|s| s.id == our_snake_id) {
+            Some(idx) => idx,
+            None => return vec![],
+        };
+
+        let mut active = vec![our_idx];
+
+        if board.snakes[our_idx].health <= 0 || board.snakes[our_idx].body.is_empty() {
+            return active;
+        }
+
+        let our_head = board.snakes[our_idx].body[0];
+        let locality_threshold =
+            config.idapos.head_distance_multiplier * remaining_depth as i32;
+
+        for (idx, snake) in board.snakes.iter().enumerate() {
+            if idx == our_idx || snake.health <= 0 {
+                continue;
+            }
+
+            // Check head distance
+            let head_dist = Self::manhattan_distance(our_head, snake.body[0]);
+            if head_dist <= locality_threshold {
+                active.push(idx);
+                continue;
+            }
+
+            // Check any body segment distance
+            for &segment in &snake.body {
+                if Self::manhattan_distance(our_head, segment) <= remaining_depth as i32 {
+                    active.push(idx);
+                    break;
+                }
+            }
+        }
+
+        active
+    }
+
+    /// Pessimistic tie-breaking for MaxN: assume opponents minimize our score
+    /// Returns the tuple with lower sum of opponent scores
+    fn pessimistic_tie_break(
+        a: &ScoreTuple,
+        b: &ScoreTuple,
+        our_idx: usize,
+    ) -> ScoreTuple {
+        let opponent_sum = |t: &ScoreTuple| {
+            t.scores
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != our_idx)
+                .map(|(_, &s)| s)
+                .sum::<i32>()
+        };
+
+        if opponent_sum(a) < opponent_sum(b) {
+            a.clone()
+        } else {
+            b.clone()
+        }
+    }
+
+    /// MaxN recursive search for multiplayer games
+    /// Each player maximizes their own score component
+    fn maxn_search(
+        board: &Board,
+        our_snake_id: &str,
+        depth: u8,
+        current_player_idx: usize,
+        config: &Config,
+    ) -> ScoreTuple {
+        // Terminal conditions
+        if depth == 0 || Self::is_terminal(board, our_snake_id, config) {
+            return Self::evaluate_state(board, our_snake_id, config);
+        }
+
+        // Check if current player is alive
+        if current_player_idx >= board.snakes.len()
+            || board.snakes[current_player_idx].health <= 0
+        {
+            // Skip to next player
+            let next = (current_player_idx + 1) % board.snakes.len();
+            return Self::maxn_search(board, our_snake_id, depth, next, config);
+        }
+
+        // Generate legal moves for current player
+        let moves = Self::generate_legal_moves(board, &board.snakes[current_player_idx], config);
+
+        if moves.is_empty() {
+            // No legal moves - mark snake as dead and continue
+            let mut dead_board = board.clone();
+            dead_board.snakes[current_player_idx].health = 0;
+            let next = (current_player_idx + 1) % board.snakes.len();
+            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config);
+        }
+
+        let mut best_tuple =
+            ScoreTuple::new_with_value(board.snakes.len(), i32::MIN);
+
+        let our_idx = board
+            .snakes
+            .iter()
+            .position(|s| &s.id == our_snake_id)
+            .unwrap_or(0);
+
+        for mv in moves {
+            let mut child_board = board.clone();
+            Self::apply_move(&mut child_board, current_player_idx, mv, config);
+
+            let next = (current_player_idx + 1) % board.snakes.len();
+            let all_moved = next == our_idx;
+
+            let child_tuple = if all_moved {
+                // All snakes have moved - advance game state and reduce depth
+                Self::advance_game_state(&mut child_board);
+                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config)
+            } else {
+                // Continue with next player at same depth
+                Self::maxn_search(&child_board, our_snake_id, depth, next, config)
+            };
+
+            // Update if current player improves their score
+            if child_tuple.for_player(current_player_idx)
+                > best_tuple.for_player(current_player_idx)
+            {
+                best_tuple = child_tuple;
+            } else if child_tuple.for_player(current_player_idx)
+                == best_tuple.for_player(current_player_idx)
+            {
+                // Pessimistic tie-breaking
+                best_tuple = Self::pessimistic_tie_break(&best_tuple, &child_tuple, our_idx);
+            }
+        }
+
+        best_tuple
+    }
+
+    /// Alpha-beta minimax for 2-player zero-sum games (1v1)
+    /// More efficient than MaxN when only two snakes remain
+    fn alpha_beta_minimax(
+        board: &Board,
+        our_snake_id: &str,
+        depth: u8,
+        mut alpha: i32,
+        mut beta: i32,
+        is_max: bool,
+        config: &Config,
+    ) -> i32 {
+        if depth == 0 || Self::is_terminal(board, our_snake_id, config) {
+            let scores = Self::evaluate_state(board, our_snake_id, config);
+            let our_idx = board
+                .snakes
+                .iter()
+                .position(|s| &s.id == our_snake_id)
+                .unwrap_or(0);
+            return scores.for_player(our_idx);
+        }
+
+        let our_idx = board
+            .snakes
+            .iter()
+            .position(|s| &s.id == our_snake_id)
+            .unwrap_or(0);
+
+        // Determine which player moves
+        let player_idx = if is_max {
+            our_idx
+        } else {
+            // Find opponent (first alive snake that isn't us)
+            board
+                .snakes
+                .iter()
+                .enumerate()
+                .find(|(i, s)| *i != our_idx && s.health > 0)
+                .map(|(i, _)| i)
+                .unwrap_or(our_idx)
+        };
+
+        if player_idx >= board.snakes.len() || board.snakes[player_idx].health <= 0 {
+            // Player is dead, return evaluation
+            let scores = Self::evaluate_state(board, our_snake_id, config);
+            return scores.for_player(our_idx);
+        }
+
+        let moves = Self::generate_legal_moves(board, &board.snakes[player_idx], config);
+
+        if moves.is_empty() {
+            let mut dead_board = board.clone();
+            dead_board.snakes[player_idx].health = 0;
+            return Self::alpha_beta_minimax(
+                &dead_board,
+                our_snake_id,
+                depth,
+                alpha,
+                beta,
+                !is_max,
+                config,
+            );
+        }
+
+        if is_max {
+            let mut max_eval = i32::MIN;
+            for mv in moves {
+                let mut child_board = board.clone();
+                Self::apply_move(&mut child_board, player_idx, mv, config);
+                Self::advance_game_state(&mut child_board);
+
+                let eval = Self::alpha_beta_minimax(
+                    &child_board,
+                    our_snake_id,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    false,
+                    config,
+                );
+                max_eval = max_eval.max(eval);
+                alpha = alpha.max(eval);
+                if beta <= alpha {
+                    break; // Beta cutoff
+                }
+            }
+            max_eval
+        } else {
+            let mut min_eval = i32::MAX;
+            for mv in moves {
+                let mut child_board = board.clone();
+                Self::apply_move(&mut child_board, player_idx, mv, config);
+                Self::advance_game_state(&mut child_board);
+
+                let eval = Self::alpha_beta_minimax(
+                    &child_board,
+                    our_snake_id,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    true,
+                    config,
+                );
+                min_eval = min_eval.min(eval);
+                beta = beta.min(eval);
+                if beta <= alpha {
+                    break; // Alpha cutoff
+                }
+            }
+            min_eval
+        }
+    }
+
+    /// Parallel multiplayer MaxN search using rayon
+    /// Evaluates root moves in parallel, then uses sequential MaxN for subtrees
+    fn parallel_multiplayer_search(
+        board: &Board,
+        you: &Battlesnake,
+        depth: u8,
+        shared: &Arc<SharedSearchState>,
+        config: &Config,
+    ) {
+        let legal_moves = Self::generate_legal_moves(board, you, config);
+
+        if legal_moves.is_empty() {
+            info!("No legal moves available");
+            shared.best_move.store(
+                config.direction_encoding.direction_up_index,
+                Ordering::Release,
+            );
+            shared.best_score.store(i32::MIN, Ordering::Release);
+            return;
+        }
+
+        info!(
+            "Evaluating {} legal moves in parallel (multiplayer MaxN)",
+            legal_moves.len()
+        );
+
+        let our_snake_id = &you.id;
+        let our_idx = board
+            .snakes
+            .iter()
+            .position(|s| &s.id == our_snake_id)
+            .unwrap_or(0);
+
+        // Parallel evaluation of root moves
+        legal_moves.par_iter().enumerate().for_each(|(_idx, &mv)| {
+            let mut child_board = board.clone();
+            Self::apply_move(&mut child_board, our_idx, mv, config);
+
+            let tuple = Self::maxn_search(
+                &child_board,
+                our_snake_id,
+                depth.saturating_sub(1),
+                our_idx,
+                config,
+            );
+            let our_score = tuple.for_player(our_idx);
+
+            // Lock-free atomic update using compare-and-swap
+            loop {
+                let current_best = shared.best_score.load(Ordering::Acquire);
+                if our_score <= current_best {
+                    break;
+                }
+
+                if shared
+                    .best_score
+                    .compare_exchange(current_best, our_score, Ordering::Release, Ordering::Acquire)
+                    .is_ok()
+                {
+                    shared
+                        .best_move
+                        .store(Self::direction_to_index(mv, config), Ordering::Release);
+                    break;
+                }
+            }
+        });
+
+        let final_score = shared.best_score.load(Ordering::Acquire);
+        info!(
+            "Parallel multiplayer search complete: best score = {}",
+            final_score
+        );
+    }
+
+    /// Parallel 1v1 alpha-beta search using rayon
+    /// Evaluates root moves in parallel, then uses sequential alpha-beta for subtrees
+    fn parallel_1v1_search(
+        board: &Board,
+        you: &Battlesnake,
+        depth: u8,
+        shared: &Arc<SharedSearchState>,
+        config: &Config,
+    ) {
+        let legal_moves = Self::generate_legal_moves(board, you, config);
+
+        if legal_moves.is_empty() {
+            info!("No legal moves available");
+            shared.best_move.store(
+                config.direction_encoding.direction_up_index,
+                Ordering::Release,
+            );
+            shared.best_score.store(i32::MIN, Ordering::Release);
+            return;
+        }
+
+        info!(
+            "Evaluating {} legal moves in parallel (1v1 alpha-beta)",
+            legal_moves.len()
+        );
+
+        let our_snake_id = &you.id;
+        let our_idx = board
+            .snakes
+            .iter()
+            .position(|s| &s.id == our_snake_id)
+            .unwrap_or(0);
+
+        // Parallel evaluation of root moves
+        legal_moves.par_iter().enumerate().for_each(|(_idx, &mv)| {
+            let mut child_board = board.clone();
+            Self::apply_move(&mut child_board, our_idx, mv, config);
+
+            let score = Self::alpha_beta_minimax(
+                &child_board,
+                our_snake_id,
+                depth.saturating_sub(1),
+                i32::MIN,
+                i32::MAX,
+                false,
+                config,
+            );
+
+            // Lock-free atomic update using compare-and-swap
+            loop {
+                let current_best = shared.best_score.load(Ordering::Acquire);
+                if score <= current_best {
+                    break;
+                }
+
+                if shared
+                    .best_score
+                    .compare_exchange(current_best, score, Ordering::Release, Ordering::Acquire)
+                    .is_ok()
+                {
+                    shared
+                        .best_move
+                        .store(Self::direction_to_index(mv, config), Ordering::Release);
+                    break;
+                }
+            }
+        });
+
+        let final_score = shared.best_score.load(Ordering::Acquire);
+        info!("Parallel 1v1 search complete: best score = {}", final_score);
     }
 }
