@@ -1,0 +1,145 @@
+# Battlesnake Configuration File
+# All tunable parameters for the MaxN algorithm implementation
+
+# ============================================================================
+# Timing & Performance Constants
+# ============================================================================
+[timing]
+# Maximum response time for move endpoint (milliseconds)
+response_time_budget_ms = 400
+# Network latency buffer (milliseconds)
+network_overhead_ms = 50
+# How often to recompute optimal move (milliseconds)
+polling_interval_ms = 50
+# Starting search depth for iterative deepening
+initial_depth = 2
+# Minimum time remaining to start new iteration (milliseconds)
+min_time_remaining_ms = 20
+# Safety cap for maximum search depth
+max_search_depth = 20
+
+# ============================================================================
+# Time Estimation Constants
+# ============================================================================
+[time_estimation]
+# Base time for iteration estimation in milliseconds
+base_iteration_time_ms = 0.01
+# Exponential branching factor for time estimation
+branching_factor = 3.5
+
+# ============================================================================
+# Strategy Selection Constants
+# ============================================================================
+[strategy]
+# Number of alive snakes to trigger 1v1 strategy
+min_snakes_for_1v1 = 2
+# Minimum CPU threads to enable parallel execution
+min_cpus_for_parallel = 2
+
+# ============================================================================
+# Evaluation Score Constants
+# ============================================================================
+[scores]
+
+# Survival Scores
+# Score penalty for dead snake
+score_dead_snake = -2147482648  # i32::MIN + 1000
+# Massive penalty for not surviving
+score_survival_penalty = -1000000
+# Weight multiplier for survival component
+score_survival_weight = 1000.0
+
+# Component Weights
+# Weight for space control score
+weight_space = 10.0
+# Weight for health/food score
+weight_health = 5.0
+# Weight for territory control score
+weight_control = 3.0
+# Weight for attack potential score
+weight_attack = 2.0
+# Weight per unit of snake length
+weight_length = 100
+
+# Health & Food Constants
+# Penalty for zero health
+score_zero_health = -100000
+# Default distance when no food exists
+default_food_distance = 999
+# Maximum snake health
+health_max = 100.0
+# Base penalty for imminent starvation
+score_starvation_base = -50000
+
+# Space Control Constants
+# Extra cells needed beyond snake length
+space_safety_margin = 5
+# Penalty multiplier per missing cell
+space_shortage_penalty = 100
+
+# Territory Control Constants
+# Scale factor for territory percentage
+territory_scale_factor = 100.0
+
+# Attack Scoring Constants
+# Max distance for head-to-head bonus
+attack_head_to_head_distance = 3
+# Bonus for length advantage near opponent
+attack_head_to_head_bonus = 50
+# Space margin to detect trapped opponent
+attack_trap_margin = 3
+# Bonus for trapping opponent
+attack_trap_bonus = 100
+
+# ============================================================================
+# IDAPOS (Locality Masking) Constants
+# ============================================================================
+[idapos]
+# Multiplier for head-to-head distance check
+head_distance_multiplier = 2
+# Min snakes in locality to switch to alpha-beta
+min_snakes_for_alpha_beta = 2
+
+# ============================================================================
+# Move Generation Constants
+# ============================================================================
+[move_generation]
+# Min body length to have a neck segment
+snake_min_body_length_for_neck = 1
+# Offset from end to exclude tail in collision check
+body_tail_offset = 1
+
+# ============================================================================
+# Player Index Constants
+# ============================================================================
+[player_indices]
+# Array index for our snake
+our_snake_index = 0
+# First player index for max player in minimax
+player_max_index = 0
+# Second player index for min player in minimax
+player_min_index = 1
+
+# ============================================================================
+# Direction Encoding Constants
+# ============================================================================
+[direction_encoding]
+# Index encoding for Up direction
+direction_up_index = 0
+# Index encoding for Down direction
+direction_down_index = 1
+# Index encoding for Left direction
+direction_left_index = 2
+# Index encoding for Right direction
+direction_right_index = 3
+
+# ============================================================================
+# Game Rules Constants
+# ============================================================================
+[game_rules]
+# Health restored when eating food
+health_on_food = 100
+# Health lost per turn
+health_loss_per_turn = 1
+# Max alive snakes for terminal state
+terminal_state_threshold = 1
