@@ -987,6 +987,49 @@ impl Bot {
         attack
     }
 
+    /// Checks if a position could result in a head-to-head collision with equal/longer opponents
+    /// Returns a penalty if the position is dangerous (could lose head-to-head)
+    fn check_head_collision_danger(
+        board: &Board,
+        snake_idx: usize,
+        position: Coord,
+        config: &Config,
+    ) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let our_snake = &board.snakes[snake_idx];
+        if our_snake.health <= 0 || our_snake.body.is_empty() {
+            return 0;
+        }
+
+        // Check each opponent
+        for (idx, opponent) in board.snakes.iter().enumerate() {
+            if idx == snake_idx || opponent.health <= 0 || opponent.body.is_empty() {
+                continue;
+            }
+
+            let opp_head = opponent.body[0];
+
+            // For each possible opponent move, check if they could reach our position
+            for dir in Direction::all() {
+                let opp_next_pos = dir.apply(&opp_head);
+
+                // If opponent could move to the same position as us
+                if opp_next_pos == position {
+                    // Check if we would lose (equal or shorter length)
+                    if our_snake.length <= opponent.length {
+                        // This is a dangerous position - we would lose or tie
+                        return config.scores.head_collision_penalty;
+                    }
+                }
+            }
+        }
+
+        0
+    }
+
     /// Evaluates the current game state for all snakes
     /// Returns an N-tuple of scores (one per snake)
     fn evaluate_state(
@@ -1011,6 +1054,13 @@ impl Bot {
             let length = snake.length * config.scores.weight_length;
             let attack = Self::compute_attack_score(board, idx, config);
 
+            // Check for head-to-head collision danger
+            let head_collision_danger = if !snake.body.is_empty() {
+                Self::check_head_collision_danger(board, idx, snake.body[0], config)
+            } else {
+                0
+            };
+
             // Weighted combination
             scores[idx] = survival
                 + (config.scores.score_survival_weight * survival as f32) as i32
@@ -1018,7 +1068,8 @@ impl Bot {
                 + (config.scores.weight_health * health as f32) as i32
                 + (config.scores.weight_control * control as f32) as i32
                 + (config.scores.weight_attack * attack as f32) as i32
-                + length;
+                + length
+                + head_collision_danger;
         }
 
         // Apply survival penalty if our snake is dead

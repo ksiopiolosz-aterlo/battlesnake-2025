@@ -94,6 +94,10 @@ attack_trap_margin = 3
 # Bonus for trapping opponent
 attack_trap_bonus = 100
 
+# Head-to-Head Collision Avoidance
+# Massive penalty for positions where we could collide head-to-head with equal/longer opponent
+head_collision_penalty = -500000
+
 # ============================================================================
 # IDAPOS (Locality Masking) Constants
 # ============================================================================

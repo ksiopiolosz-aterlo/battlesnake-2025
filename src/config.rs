@@ -88,6 +88,9 @@ pub struct ScoresConfig {
     pub attack_head_to_head_bonus: i32,
     pub attack_trap_margin: usize,
     pub attack_trap_bonus: i32,
+
+    // Head-to-head collision avoidance
+    pub head_collision_penalty: i32,
 }
 
 /// IDAPOS (Locality Masking) constants
@@ -191,6 +194,7 @@ impl Config {
                 attack_head_to_head_bonus: 50,
                 attack_trap_margin: 3,
                 attack_trap_bonus: 100,
+                head_collision_penalty: -500_000,
             },
             idapos: IdaposConfig {
                 head_distance_multiplier: 2,
