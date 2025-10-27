@@ -5,9 +5,80 @@ You are collaborating on a competitive **Battlesnakes** bot (https://docs.battle
 ## Configuration Parameters
 
 These are tunable parameters (consider externalizing to a config file):
+
+### Timing & Performance Constants
 - `RESPONSE_TIME_BUDGET_MS`: Maximum response time for move endpoint (default: 400ms)
+- `NETWORK_OVERHEAD_MS`: Network latency buffer (default: 50ms)
+- `EFFECTIVE_BUDGET_MS`: Actual computation time (RESPONSE_TIME_BUDGET_MS - NETWORK_OVERHEAD_MS) (default: 350ms)
 - `POLLING_INTERVAL_MS`: How often to recompute optimal move (default: 50ms)
-- Weights for scoring function (see Priorities section)
+- `INITIAL_DEPTH`: Starting search depth for iterative deepening (default: 2)
+- `MIN_TIME_REMAINING_MS`: Minimum time remaining to start new iteration (default: 20ms)
+- `MAX_SEARCH_DEPTH`: Safety cap for maximum search depth (default: 20)
+
+### Time Estimation Constants
+- `BASE_ITERATION_TIME_MS`: Base time for iteration estimation in milliseconds (default: 0.01)
+- `BRANCHING_FACTOR`: Exponential branching factor for time estimation (default: 3.5)
+
+### Strategy Selection Constants
+- `MIN_SNAKES_FOR_1V1`: Number of alive snakes to trigger 1v1 strategy (default: 2)
+- `MIN_CPUS_FOR_PARALLEL`: Minimum CPU threads to enable parallel execution (default: 2)
+
+### Evaluation Score Constants
+
+#### Survival Scores
+- `SCORE_DEAD_SNAKE`: Score penalty for dead snake (default: i32::MIN + 1000)
+- `SCORE_SURVIVAL_PENALTY`: Massive penalty for not surviving (default: -1_000_000)
+- `SCORE_SURVIVAL_WEIGHT`: Weight multiplier for survival component (default: 1000.0)
+
+#### Component Weights
+- `WEIGHT_SPACE`: Weight for space control score (default: 10.0)
+- `WEIGHT_HEALTH`: Weight for health/food score (default: 5.0)
+- `WEIGHT_CONTROL`: Weight for territory control score (default: 3.0)
+- `WEIGHT_ATTACK`: Weight for attack potential score (default: 2.0)
+- `WEIGHT_LENGTH`: Weight per unit of snake length (default: 100)
+
+#### Health & Food Constants
+- `SCORE_ZERO_HEALTH`: Penalty for zero health (default: -100_000)
+- `DEFAULT_FOOD_DISTANCE`: Default distance when no food exists (default: 999)
+- `HEALTH_MAX`: Maximum snake health (default: 100.0)
+- `SCORE_STARVATION_BASE`: Base penalty for imminent starvation (default: -50_000)
+
+#### Space Control Constants
+- `SPACE_SAFETY_MARGIN`: Extra cells needed beyond snake length (default: 5)
+- `SPACE_SHORTAGE_PENALTY`: Penalty multiplier per missing cell (default: 100)
+
+#### Territory Control Constants
+- `TERRITORY_SCALE_FACTOR`: Scale factor for territory percentage (default: 100.0)
+
+#### Attack Scoring Constants
+- `ATTACK_HEAD_TO_HEAD_DISTANCE`: Max distance for head-to-head bonus (default: 3)
+- `ATTACK_HEAD_TO_HEAD_BONUS`: Bonus for length advantage near opponent (default: 50)
+- `ATTACK_TRAP_MARGIN`: Space margin to detect trapped opponent (default: 3)
+- `ATTACK_TRAP_BONUS`: Bonus for trapping opponent (default: 100)
+
+### IDAPOS (Locality Masking) Constants
+- `IDAPOS_HEAD_DISTANCE_MULTIPLIER`: Multiplier for head-to-head distance check (default: 2)
+- `IDAPOS_MIN_SNAKES_FOR_ALPHA_BETA`: Min snakes in locality to switch to alpha-beta (default: 2)
+
+### Move Generation Constants
+- `SNAKE_MIN_BODY_LENGTH_FOR_NECK`: Min body length to have a neck segment (default: 1)
+- `BODY_TAIL_OFFSET`: Offset from end to exclude tail in collision check (default: 1)
+
+### Player Index Constants
+- `OUR_SNAKE_INDEX`: Array index for our snake (default: 0)
+- `PLAYER_MAX_INDEX`: First player index for max player in minimax (default: 0)
+- `PLAYER_MIN_INDEX`: Second player index for min player in minimax (default: 1)
+
+### Direction Encoding Constants
+- `DIRECTION_UP_INDEX`: Index encoding for Up direction (default: 0)
+- `DIRECTION_DOWN_INDEX`: Index encoding for Down direction (default: 1)
+- `DIRECTION_LEFT_INDEX`: Index encoding for Left direction (default: 2)
+- `DIRECTION_RIGHT_INDEX`: Index encoding for Right direction (default: 3)
+
+### Game Rules Constants
+- `HEALTH_ON_FOOD`: Health restored when eating food (default: 100)
+- `HEALTH_LOSS_PER_TURN`: Health lost per turn (default: 1)
+- `TERMINAL_STATE_THRESHOLD`: Max alive snakes for terminal state (default: 1)
 
 ---
 
@@ -77,16 +148,79 @@ The implementation uses three concurrent components communicating via lock-free 
 ### Core Data Structures
 
 ```rust
-// Configuration constants
-const RESPONSE_TIME_BUDGET_MS: u64 = 400;  // Total allowed time
-const NETWORK_OVERHEAD_MS: u64 = 50;        // Network latency buffer
-const EFFECTIVE_BUDGET_MS: u64 = 350;       // Actual computation time
-const POLLING_INTERVAL_MS: u64 = 50;        // Update frequency
-const INITIAL_DEPTH: u8 = 2;                // Starting search depth
+// Timing & Performance Constants
+const RESPONSE_TIME_BUDGET_MS: u64 = 400;
+const NETWORK_OVERHEAD_MS: u64 = 50;
+const EFFECTIVE_BUDGET_MS: u64 = RESPONSE_TIME_BUDGET_MS - NETWORK_OVERHEAD_MS;
+const POLLING_INTERVAL_MS: u64 = 50;
+const INITIAL_DEPTH: u8 = 2;
+const MIN_TIME_REMAINING_MS: u64 = 20;
+const MAX_SEARCH_DEPTH: u8 = 20;
+
+// Time Estimation Constants
+const BASE_ITERATION_TIME_MS: f64 = 0.01;
+const BRANCHING_FACTOR: f64 = 3.5;
+
+// Strategy Selection Constants
+const MIN_SNAKES_FOR_1V1: usize = 2;
+const MIN_CPUS_FOR_PARALLEL: usize = 2;
+
+// Evaluation Score Constants
+const SCORE_DEAD_SNAKE: i32 = i32::MIN + 1000;
+const SCORE_SURVIVAL_PENALTY: i32 = -1_000_000;
+const SCORE_SURVIVAL_WEIGHT: f32 = 1000.0;
+const WEIGHT_SPACE: f32 = 10.0;
+const WEIGHT_HEALTH: f32 = 5.0;
+const WEIGHT_CONTROL: f32 = 3.0;
+const WEIGHT_ATTACK: f32 = 2.0;
+const WEIGHT_LENGTH: i32 = 100;
+
+// Health & Food Constants
+const SCORE_ZERO_HEALTH: i32 = -100_000;
+const DEFAULT_FOOD_DISTANCE: i32 = 999;
+const HEALTH_MAX: f32 = 100.0;
+const SCORE_STARVATION_BASE: i32 = -50_000;
+
+// Space Control Constants
+const SPACE_SAFETY_MARGIN: usize = 5;
+const SPACE_SHORTAGE_PENALTY: i32 = 100;
+
+// Territory Control Constants
+const TERRITORY_SCALE_FACTOR: f32 = 100.0;
+
+// Attack Scoring Constants
+const ATTACK_HEAD_TO_HEAD_DISTANCE: i32 = 3;
+const ATTACK_HEAD_TO_HEAD_BONUS: i32 = 50;
+const ATTACK_TRAP_MARGIN: usize = 3;
+const ATTACK_TRAP_BONUS: i32 = 100;
+
+// IDAPOS Constants
+const IDAPOS_HEAD_DISTANCE_MULTIPLIER: i32 = 2;
+const IDAPOS_MIN_SNAKES_FOR_ALPHA_BETA: usize = 2;
+
+// Player Index Constants
+const OUR_SNAKE_INDEX: usize = 0;
+const PLAYER_MAX_INDEX: usize = 0;
+const PLAYER_MIN_INDEX: usize = 1;
+
+// Direction Encoding Constants
+const DIRECTION_UP_INDEX: u8 = 0;
+const DIRECTION_DOWN_INDEX: u8 = 1;
+const DIRECTION_LEFT_INDEX: u8 = 2;
+const DIRECTION_RIGHT_INDEX: u8 = 3;
+
+// Game Rules Constants
+const HEALTH_ON_FOOD: u8 = 100;
+const HEALTH_LOSS_PER_TURN: u8 = 1;
+const TERMINAL_STATE_THRESHOLD: usize = 1;
+
+// Move Generation Constants
+const SNAKE_MIN_BODY_LENGTH_FOR_NECK: usize = 1;
+const BODY_TAIL_OFFSET: usize = 1;
 
 // Lock-free shared state
 struct SharedSearchState {
-    best_move: Arc<AtomicU8>,           // 0=Up, 1=Down, 2=Left, 3=Right
+    best_move: Arc<AtomicU8>,           // Uses DIRECTION_*_INDEX encoding
     best_score: Arc<AtomicI32>,         // Current best utility
     search_complete: Arc<AtomicBool>,   // Completion signal
     current_depth: Arc<AtomicU8>,       // Active search depth
@@ -96,14 +230,14 @@ struct SharedSearchState {
 struct GameState {
     board_width: u8,
     board_height: u8,
-    snakes: Vec<Snake>,    // Index 0 = our snake
+    snakes: Vec<Snake>,    // Index OUR_SNAKE_INDEX = our snake
     food: Vec<Coord>,
     turn: u32,
 }
 
 struct Snake {
     id: String,
-    health: u8,            // 0-100
+    health: u8,            // 0 to HEALTH_ON_FOOD
     body: Vec<Coord>,      // [head, segment1, ..., tail]
     length: usize,
     is_alive: bool,
@@ -158,9 +292,9 @@ fn compute_best_move(
     let num_cpus = rayon::current_num_threads();
 
     let strategy = match (num_snakes, num_cpus) {
-        (2, n) if n > 1 => ExecutionStrategy::Parallel1v1,      // Alpha-beta
-        (_, n) if n > 1 => ExecutionStrategy::ParallelMultiplayer, // MaxN
-        _ => ExecutionStrategy::Sequential,                     // No parallelism
+        (MIN_SNAKES_FOR_1V1, n) if n >= MIN_CPUS_FOR_PARALLEL => ExecutionStrategy::Parallel1v1,
+        (_, n) if n >= MIN_CPUS_FOR_PARALLEL => ExecutionStrategy::ParallelMultiplayer,
+        _ => ExecutionStrategy::Sequential,
     };
 
     // Iterative deepening loop
@@ -170,7 +304,7 @@ fn compute_best_move(
             start_time.elapsed().as_millis() as u64
         );
 
-        if remaining < 20 ||
+        if remaining < MIN_TIME_REMAINING_MS ||
            estimate_iteration_time(current_depth, num_snakes) > remaining {
             break;
         }
@@ -186,25 +320,25 @@ fn compute_best_move(
         }
 
         current_depth += 1;
-        if current_depth > 20 { break; }  // Safety cap
+        if current_depth > MAX_SEARCH_DEPTH { break; }
     }
 
     shared.search_complete.store(true, Ordering::Release);
 }
 
-// Time estimation: exponential branching ~4^(depth×snakes)
+// Time estimation: exponential branching
 fn estimate_iteration_time(depth: u8, num_snakes: usize) -> u64 {
     let exponent = (depth as f64) * (num_snakes as f64);
-    (0.01 * 3.5_f64.powf(exponent)).ceil() as u64
+    (BASE_ITERATION_TIME_MS * BRANCHING_FACTOR.powf(exponent)).ceil() as u64
 }
 ```
 
 **Step 3: Parallel 1v1 Search (Alpha-Beta Optimization)**
 ```rust
 fn parallel_1v1_search(state: &GameState, depth: u8, shared: &Arc<SharedSearchState>) {
-    let our_moves = generate_legal_moves(state, 0);
+    let our_moves = generate_legal_moves(state, OUR_SNAKE_INDEX);
     if our_moves.is_empty() {
-        shared.best_move.store(0, Ordering::Release);
+        shared.best_move.store(DIRECTION_UP_INDEX, Ordering::Release);
         shared.best_score.store(i32::MIN, Ordering::Release);
         return;
     }
@@ -212,7 +346,7 @@ fn parallel_1v1_search(state: &GameState, depth: u8, shared: &Arc<SharedSearchSt
     // Parallel evaluation: one thread per root move
     our_moves.par_iter().enumerate().for_each(|(idx, &mv)| {
         let mut child = state.clone();
-        apply_move(&mut child, 0, mv);
+        apply_move(&mut child, OUR_SNAKE_INDEX, mv);
 
         // Use alpha-beta for opponent (2-player zero-sum optimization)
         let score = alpha_beta_minimax(&child, depth - 1, i32::MIN, i32::MAX, false);
@@ -236,10 +370,10 @@ fn alpha_beta_minimax(
     state: &GameState, depth: u8, mut alpha: i32, mut beta: i32, is_max: bool
 ) -> i32 {
     if depth == 0 || is_terminal(state) {
-        return evaluate_state(state, 0).for_player(0);
+        return evaluate_state(state, OUR_SNAKE_INDEX).for_player(OUR_SNAKE_INDEX);
     }
 
-    let player = if is_max { 0 } else { 1 };
+    let player = if is_max { PLAYER_MAX_INDEX } else { PLAYER_MIN_INDEX };
     let moves = generate_legal_moves(state, player);
 
     if is_max {
@@ -271,19 +405,19 @@ fn alpha_beta_minimax(
 **Step 4: Parallel Multiplayer MaxN Search**
 ```rust
 fn parallel_multiplayer_search(state: &GameState, depth: u8, shared: &Arc<SharedSearchState>) {
-    let our_moves = generate_legal_moves(state, 0);
+    let our_moves = generate_legal_moves(state, OUR_SNAKE_INDEX);
     if our_moves.is_empty() {
-        shared.best_move.store(0, Ordering::Release);
+        shared.best_move.store(DIRECTION_UP_INDEX, Ordering::Release);
         shared.best_score.store(i32::MIN, Ordering::Release);
         return;
     }
 
     our_moves.par_iter().enumerate().for_each(|(idx, &mv)| {
         let mut child = state.clone();
-        apply_move(&mut child, 0, mv);
+        apply_move(&mut child, OUR_SNAKE_INDEX, mv);
 
-        let score_tuple = maxn_search(&child, depth - 1, 0);
-        let our_score = score_tuple.for_player(0);
+        let score_tuple = maxn_search(&child, depth - 1, OUR_SNAKE_INDEX);
+        let our_score = score_tuple.for_player(OUR_SNAKE_INDEX);
 
         // Atomic update
         loop {
@@ -302,16 +436,16 @@ fn parallel_multiplayer_search(state: &GameState, depth: u8, shared: &Arc<Shared
 
 fn maxn_search(state: &GameState, depth: u8, current_player: usize) -> ScoreTuple {
     if depth == 0 || is_terminal(state) {
-        return evaluate_state(state, 0);
+        return evaluate_state(state, OUR_SNAKE_INDEX);
     }
 
     // IDAPOS: Locality masking optimization
     let active_snakes = determine_active_snakes(state, depth);
 
     // Switch to alpha-beta if only 2 snakes in locality
-    if active_snakes.len() == 2 && active_snakes.contains(&0) {
-        let other = *active_snakes.iter().find(|&&i| i != 0).unwrap();
-        return alpha_beta_for_two_snakes(state, depth, 0, other);
+    if active_snakes.len() == IDAPOS_MIN_SNAKES_FOR_ALPHA_BETA && active_snakes.contains(&OUR_SNAKE_INDEX) {
+        let other = *active_snakes.iter().find(|&&i| i != OUR_SNAKE_INDEX).unwrap();
+        return alpha_beta_for_two_snakes(state, depth, OUR_SNAKE_INDEX, other);
     }
 
     // Standard MaxN recursion
@@ -330,11 +464,11 @@ fn maxn_search(state: &GameState, depth: u8, current_player: usize) -> ScoreTupl
         apply_move(&mut child, current_player, mv);
 
         let next = (current_player + 1) % state.snakes.len();
-        let all_moved = next == 0;
+        let all_moved = next == OUR_SNAKE_INDEX;
 
         let child_tuple = if all_moved {
             advance_game_state(&mut child);
-            maxn_search(&child, depth - 1, 0)
+            maxn_search(&child, depth - 1, OUR_SNAKE_INDEX)
         } else {
             maxn_search(&child, depth, next)
         };
@@ -344,7 +478,7 @@ fn maxn_search(state: &GameState, depth: u8, current_player: usize) -> ScoreTupl
             best_tuple = child_tuple;
         } else if child_tuple.for_player(current_player) == best_tuple.for_player(current_player) {
             // Pessimistic tie-breaking
-            best_tuple = pessimistic_tie_break(&best_tuple, &child_tuple, 0);
+            best_tuple = pessimistic_tie_break(&best_tuple, &child_tuple, OUR_SNAKE_INDEX);
         }
     }
 
@@ -353,14 +487,14 @@ fn maxn_search(state: &GameState, depth: u8, current_player: usize) -> ScoreTupl
 
 // IDAPOS: Mask non-local snakes to reduce branching
 fn determine_active_snakes(state: &GameState, remaining_depth: u8) -> Vec<usize> {
-    let mut active = vec![0];
-    let our_head = state.snakes[0].body[0];
+    let mut active = vec![OUR_SNAKE_INDEX];
+    let our_head = state.snakes[OUR_SNAKE_INDEX].body[0];
 
-    for (idx, snake) in state.snakes.iter().enumerate().skip(1) {
+    for (idx, snake) in state.snakes.iter().enumerate().skip(OUR_SNAKE_INDEX + 1) {
         if !snake.is_alive { continue; }
 
         let head_dist = manhattan_distance(our_head, snake.body[0]);
-        if head_dist <= 2 * remaining_depth as i32 {
+        if head_dist <= IDAPOS_HEAD_DISTANCE_MULTIPLIER * remaining_depth as i32 {
             active.push(idx);
             continue;
         }
@@ -393,7 +527,7 @@ fn pessimistic_tie_break(a: &ScoreTuple, b: &ScoreTuple, our_idx: usize) -> Scor
 fn sequential_search(state: &GameState, depth: u8, shared: &Arc<SharedSearchState>) {
     let num_snakes = state.snakes.iter().filter(|s| s.is_alive).count();
 
-    if num_snakes == 2 {
+    if num_snakes == MIN_SNAKES_FOR_1V1 {
         sequential_1v1_search(state, depth, shared);
     } else {
         sequential_multiplayer_search(state, depth, shared);
@@ -401,9 +535,9 @@ fn sequential_search(state: &GameState, depth: u8, shared: &Arc<SharedSearchStat
 }
 
 fn sequential_1v1_search(state: &GameState, depth: u8, shared: &Arc<SharedSearchState>) {
-    let moves = generate_legal_moves(state, 0);
+    let moves = generate_legal_moves(state, OUR_SNAKE_INDEX);
     if moves.is_empty() {
-        shared.best_move.store(0, Ordering::Release);
+        shared.best_move.store(DIRECTION_UP_INDEX, Ordering::Release);
         shared.best_score.store(i32::MIN, Ordering::Release);
         return;
     }
@@ -413,7 +547,7 @@ fn sequential_1v1_search(state: &GameState, depth: u8, shared: &Arc<SharedSearch
 
     for (idx, &mv) in moves.iter().enumerate() {
         let mut child = state.clone();
-        apply_move(&mut child, 0, mv);
+        apply_move(&mut child, OUR_SNAKE_INDEX, mv);
 
         let score = alpha_beta_minimax(&child, depth - 1, i32::MIN, i32::MAX, false);
 
@@ -429,9 +563,9 @@ fn sequential_1v1_search(state: &GameState, depth: u8, shared: &Arc<SharedSearch
 }
 
 fn sequential_multiplayer_search(state: &GameState, depth: u8, shared: &Arc<SharedSearchState>) {
-    let moves = generate_legal_moves(state, 0);
+    let moves = generate_legal_moves(state, OUR_SNAKE_INDEX);
     if moves.is_empty() {
-        shared.best_move.store(0, Ordering::Release);
+        shared.best_move.store(DIRECTION_UP_INDEX, Ordering::Release);
         shared.best_score.store(i32::MIN, Ordering::Release);
         return;
     }
@@ -441,10 +575,10 @@ fn sequential_multiplayer_search(state: &GameState, depth: u8, shared: &Arc<Shar
 
     for (idx, &mv) in moves.iter().enumerate() {
         let mut child = state.clone();
-        apply_move(&mut child, 0, mv);
+        apply_move(&mut child, OUR_SNAKE_INDEX, mv);
 
-        let tuple = maxn_search(&child, depth - 1, 0);
-        let score = tuple.for_player(0);
+        let tuple = maxn_search(&child, depth - 1, OUR_SNAKE_INDEX);
+        let score = tuple.for_player(OUR_SNAKE_INDEX);
 
         if score > best_score {
             best_score = score;
@@ -465,25 +599,25 @@ fn evaluate_state(state: &GameState, our_idx: usize) -> ScoreTuple {
 
     for (idx, snake) in state.snakes.iter().enumerate() {
         if !snake.is_alive {
-            scores[idx] = i32::MIN + 1000;
+            scores[idx] = SCORE_DEAD_SNAKE;
             continue;
         }
 
         // Component values
-        let survival = if snake.is_alive { 0 } else { -1_000_000 };
+        let survival = if snake.is_alive { 0 } else { SCORE_SURVIVAL_PENALTY };
         let health = compute_health_score(state, idx);
         let space = compute_space_score(state, idx);
         let control = compute_control_score(state, idx);
-        let length = (snake.length as i32) * 100;
+        let length = (snake.length as i32) * WEIGHT_LENGTH;
         let attack = compute_attack_score(state, idx);
 
         // Weighted combination (tune these coefficients)
         scores[idx] = survival
-            + (1000.0 * survival as f32) as i32
-            + (10.0 * space as f32) as i32
-            + (5.0 * health as f32) as i32
-            + (3.0 * control as f32) as i32
-            + (2.0 * attack as f32) as i32
+            + (SCORE_SURVIVAL_WEIGHT * survival as f32) as i32
+            + (WEIGHT_SPACE * space as f32) as i32
+            + (WEIGHT_HEALTH * health as f32) as i32
+            + (WEIGHT_CONTROL * control as f32) as i32
+            + (WEIGHT_ATTACK * attack as f32) as i32
             + length;
     }
 
@@ -506,20 +640,20 @@ fn evaluate_state(state: &GameState, our_idx: usize) -> ScoreTuple {
 ```rust
 fn compute_health_score(state: &GameState, snake_idx: usize) -> i32 {
     let snake = &state.snakes[snake_idx];
-    if snake.health == 0 { return -100_000; }
+    if snake.health == 0 { return SCORE_ZERO_HEALTH; }
 
     let head = snake.body[0];
     let nearest_food = state.food.iter()
         .map(|&food| manhattan_distance(head, food))
         .min()
-        .unwrap_or(999);
+        .unwrap_or(DEFAULT_FOOD_DISTANCE);
 
-    let urgency = (100.0 - snake.health as f32) / 100.0;
+    let urgency = (HEALTH_MAX - snake.health as f32) / HEALTH_MAX;
     let distance_penalty = -(nearest_food as f32 * urgency) as i32;
 
     // Starvation check
     if snake.health <= nearest_food as u8 {
-        return -50_000 + distance_penalty;
+        return SCORE_STARVATION_BASE + distance_penalty;
     }
 
     distance_penalty
@@ -533,9 +667,9 @@ fn compute_space_score(state: &GameState, snake_idx: usize) -> i32 {
     let snake = &state.snakes[snake_idx];
     let reachable = flood_fill_bfs(state, snake.body[0], snake_idx);
 
-    let required = snake.length + 5;  // Safety margin
+    let required = snake.length + SPACE_SAFETY_MARGIN;
     if reachable < required {
-        return -(required as i32 - reachable as i32) * 100;
+        return -(required as i32 - reachable as i32) * SPACE_SHORTAGE_PENALTY;
     }
 
     reachable as i32
@@ -606,7 +740,7 @@ fn compute_control_score(state: &GameState, snake_idx: usize) -> i32 {
 
     if total_free == 0 { return 0; }
 
-    ((our_cells as f32 / total_free as f32) * 100.0) as i32
+    ((our_cells as f32 / total_free as f32) * TERRITORY_SCALE_FACTOR) as i32
 }
 
 fn adversarial_flood_fill(state: &GameState) -> Vec<Option<usize>> {
@@ -669,13 +803,15 @@ fn compute_attack_score(state: &GameState, snake_idx: usize) -> i32 {
         // Advantage if longer (can win head-to-head)
         if our_snake.length > opponent.length {
             let dist = manhattan_distance(our_head, opponent.body[0]);
-            if dist <= 3 { attack += 50; }
+            if dist <= ATTACK_HEAD_TO_HEAD_DISTANCE {
+                attack += ATTACK_HEAD_TO_HEAD_BONUS;
+            }
         }
 
         // Trap potential
         let opp_space = flood_fill_bfs(state, opponent.body[0], idx);
-        if opp_space < opponent.length + 3 {
-            attack += 100;  // Opponent trapped
+        if opp_space < opponent.length + ATTACK_TRAP_MARGIN {
+            attack += ATTACK_TRAP_BONUS;
         }
     }
 
@@ -694,7 +830,11 @@ fn generate_legal_moves(state: &GameState, snake_idx: usize) -> Vec<Direction> {
     if !snake.is_alive || snake.body.is_empty() { return vec![]; }
 
     let head = snake.body[0];
-    let neck = if snake.body.len() > 1 { Some(snake.body[1]) } else { None };
+    let neck = if snake.body.len() > SNAKE_MIN_BODY_LENGTH_FOR_NECK {
+        Some(snake.body[1])
+    } else {
+        None
+    };
 
     [Direction::Up, Direction::Down, Direction::Left, Direction::Right]
         .iter()
@@ -715,8 +855,8 @@ fn generate_legal_moves(state: &GameState, snake_idx: usize) -> Vec<Direction> {
             // Can't collide with bodies (except tails which will move)
             for other in &state.snakes {
                 if !other.is_alive { continue; }
-                let body_check = if other.body.len() > 1 {
-                    &other.body[..other.body.len() - 1]
+                let body_check = if other.body.len() > BODY_TAIL_OFFSET {
+                    &other.body[..other.body.len() - BODY_TAIL_OFFSET]
                 } else {
                     &other.body[..]
                 };
@@ -737,11 +877,11 @@ fn apply_move(state: &mut GameState, snake_idx: usize, dir: Direction) {
 
     if state.food.contains(&new_head) {
         state.food.retain(|&f| f != new_head);
-        snake.health = 100;
+        snake.health = HEALTH_ON_FOOD;
         snake.length += 1;
     } else {
         snake.body.pop();
-        snake.health = snake.health.saturating_sub(1);
+        snake.health = snake.health.saturating_sub(HEALTH_LOSS_PER_TURN);
     }
 
     if snake.health == 0 { snake.is_alive = false; }
@@ -792,15 +932,16 @@ fn manhattan_distance(a: Coord, b: Coord) -> i32 {
 }
 
 fn is_terminal(state: &GameState) -> bool {
-    state.snakes.iter().filter(|s| s.is_alive).count() <= 1
+  let alive_count = state.snakes.iter().filter(|s| s.is_alive).count();
+  alive_count <= 1 || state.snakes[OUR_SNAKE_INDEX].is_alive == false
 }
 
 fn index_to_direction(idx: u8) -> String {
     match idx {
-        0 => "up".to_string(),
-        1 => "down".to_string(),
-        2 => "left".to_string(),
-        3 => "right".to_string(),
+        DIRECTION_UP_INDEX => "up".to_string(),
+        DIRECTION_DOWN_INDEX => "down".to_string(),
+        DIRECTION_LEFT_INDEX => "left".to_string(),
+        DIRECTION_RIGHT_INDEX => "right".to_string(),
         _ => "up".to_string(),
     }
 }
