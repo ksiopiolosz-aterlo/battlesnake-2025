@@ -26,6 +26,9 @@ max_search_depth = 20
 base_iteration_time_ms = 0.01
 # Exponential branching factor for time estimation
 branching_factor = 3.5
+# Blending factor for adaptive estimation (0.0 = pure empirical, 1.0 = pure model)
+# Recommended: 0.3-0.5 for balanced approach
+model_weight = 0.4
 
 # ============================================================================
 # Strategy Selection Constants

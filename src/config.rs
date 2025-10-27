@@ -42,6 +42,10 @@ impl TimingConfig {
 pub struct TimeEstimationConfig {
     pub base_iteration_time_ms: f64,
     pub branching_factor: f64,
+    /// Blending factor for adaptive estimation
+    /// 0.0 = pure empirical (100% observed), 1.0 = pure model (100% formula)
+    /// Recommended: 0.3-0.5 for balanced approach
+    pub model_weight: f64,
 }
 
 /// Strategy selection constants
@@ -161,6 +165,7 @@ impl Config {
             time_estimation: TimeEstimationConfig {
                 base_iteration_time_ms: 0.01,
                 branching_factor: 3.5,
+                model_weight: 0.4,
             },
             strategy: StrategyConfig {
                 min_snakes_for_1v1: 2,

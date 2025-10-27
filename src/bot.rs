@@ -30,6 +30,102 @@ enum ExecutionStrategy {
     ParallelMultiplayer,
 }
 
+/// Adaptive time estimation tracking empirical iteration times
+/// Uses exponential moving average to blend observed times with model predictions
+#[derive(Debug, Clone)]
+struct AdaptiveTimeEstimator {
+    /// Observed average time per depth level (index = depth, value = average time in ms)
+    depth_timings: Vec<f64>,
+    /// Number of observations per depth level for calculating running average
+    depth_observations: Vec<u32>,
+    /// Blending factor for combining empirical data with model predictions
+    /// 0.0 = pure empirical (100% observed data), 1.0 = pure model (100% formula)
+    model_weight: f64,
+    /// Fallback configuration for exponential model
+    base_time_ms: f64,
+    branching_factor: f64,
+}
+
+impl AdaptiveTimeEstimator {
+    /// Creates a new adaptive estimator with configuration parameters
+    fn new(base_time_ms: f64, branching_factor: f64, model_weight: f64) -> Self {
+        Self {
+            depth_timings: Vec::new(),
+            depth_observations: Vec::new(),
+            model_weight: model_weight.clamp(0.0, 1.0),
+            base_time_ms,
+            branching_factor,
+        }
+    }
+
+    /// Records an observed iteration time at a specific depth
+    fn record_observation(&mut self, depth: u8, elapsed_ms: f64) {
+        let depth_idx = depth as usize;
+
+        // Expand vectors if needed
+        while self.depth_timings.len() <= depth_idx {
+            self.depth_timings.push(0.0);
+            self.depth_observations.push(0);
+        }
+
+        // Update running average using incremental mean formula
+        let n = self.depth_observations[depth_idx] as f64;
+        let old_avg = self.depth_timings[depth_idx];
+        let new_avg = (old_avg * n + elapsed_ms) / (n + 1.0);
+
+        self.depth_timings[depth_idx] = new_avg;
+        self.depth_observations[depth_idx] += 1;
+    }
+
+    /// Estimates time for an iteration at a given depth
+    /// Blends empirical observations with exponential model
+    fn estimate(&self, depth: u8, num_snakes: usize) -> u64 {
+        let depth_idx = depth as usize;
+
+        // Calculate model prediction (exponential branching)
+        let exponent = (depth as f64) * (num_snakes as f64);
+        let model_estimate = self.base_time_ms * self.branching_factor.powf(exponent);
+
+        // If we have observations for this exact depth, blend with empirical data
+        if depth_idx < self.depth_timings.len() && self.depth_observations[depth_idx] > 0 {
+            let empirical_estimate = self.depth_timings[depth_idx];
+            let blended = self.model_weight * model_estimate
+                + (1.0 - self.model_weight) * empirical_estimate;
+            return blended.ceil() as u64;
+        }
+
+        // If we have observations for earlier depths, extrapolate using ratio
+        if let Some(last_observed_depth) = self.find_last_observed_depth(depth) {
+            let observed_time = self.depth_timings[last_observed_depth];
+
+            // Calculate expected ratio between depths using model
+            let depth_gap = depth - last_observed_depth as u8;
+            let exponent_gap = (depth_gap as f64) * (num_snakes as f64);
+            let ratio = self.branching_factor.powf(exponent_gap);
+
+            let extrapolated = observed_time * ratio;
+
+            // Blend extrapolation with pure model
+            let blended =
+                self.model_weight * model_estimate + (1.0 - self.model_weight) * extrapolated;
+            return blended.ceil() as u64;
+        }
+
+        // No observations yet - fall back to pure model
+        model_estimate.ceil() as u64
+    }
+
+    /// Finds the highest depth we have observations for, up to the given depth
+    fn find_last_observed_depth(&self, max_depth: u8) -> Option<usize> {
+        for depth in (0..=max_depth as usize).rev() {
+            if depth < self.depth_observations.len() && self.depth_observations[depth] > 0 {
+                return Some(depth);
+            }
+        }
+        None
+    }
+}
+
 /// Lock-free shared state for communication between async poller and computation engine
 #[derive(Debug)]
 struct SharedSearchState {
@@ -191,6 +287,13 @@ impl Bot {
             strategy, num_alive_snakes, num_cpus
         );
 
+        // Initialize adaptive time estimator
+        let mut time_estimator = AdaptiveTimeEstimator::new(
+            config.time_estimation.base_iteration_time_ms,
+            config.time_estimation.branching_factor,
+            config.time_estimation.model_weight,
+        );
+
         // Iterative deepening loop
         let mut current_depth = config.timing.initial_depth;
         let effective_budget = config.timing.effective_budget_ms();
@@ -208,9 +311,8 @@ impl Bot {
                 break;
             }
 
-            // Estimate time for next iteration
-            let estimated_time =
-                Self::estimate_iteration_time(current_depth, num_alive_snakes, config);
+            // Estimate time for next iteration using adaptive estimator
+            let estimated_time = time_estimator.estimate(current_depth, num_alive_snakes);
             if estimated_time > remaining {
                 info!("Stopping search: next iteration would exceed budget (estimated {}ms, remaining {}ms)",
                       estimated_time, remaining);
@@ -223,8 +325,14 @@ impl Bot {
                 break;
             }
 
-            info!("Starting iteration at depth {}", current_depth);
+            info!(
+                "Starting iteration at depth {} (estimated time: {}ms)",
+                current_depth, estimated_time
+            );
             shared.current_depth.store(current_depth, Ordering::Release);
+
+            // Record iteration start time
+            let iteration_start = Instant::now();
 
             // Execute search based on strategy
             match strategy {
@@ -242,6 +350,15 @@ impl Bot {
                     Self::sequential_search(board, you, current_depth, &shared, config);
                 }
             }
+
+            // Record actual iteration time
+            let iteration_elapsed = iteration_start.elapsed().as_millis() as f64;
+            time_estimator.record_observation(current_depth, iteration_elapsed);
+
+            info!(
+                "Completed depth {} in {:.2}ms (estimated: {}ms)",
+                current_depth, iteration_elapsed, estimated_time
+            );
 
             current_depth += 1;
         }
@@ -272,15 +389,6 @@ impl Bot {
             }
             _ => ExecutionStrategy::Sequential,
         }
-    }
-
-    /// Estimates the time required for an iteration at a given depth
-    /// Uses exponential branching model: time ≈ base * branching_factor^(depth * num_snakes)
-    fn estimate_iteration_time(depth: u8, num_snakes: usize, config: &Config) -> u64 {
-        let exponent = (depth as f64) * (num_snakes as f64);
-        let estimate = config.time_estimation.base_iteration_time_ms
-            * config.time_estimation.branching_factor.powf(exponent);
-        estimate.ceil() as u64
     }
 
     /// Sequential search implementation (works on any hardware)
