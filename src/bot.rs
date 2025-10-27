@@ -490,6 +490,7 @@ impl Bot {
     /// - Doesn't go out of bounds
     /// - Doesn't collide with snake bodies (excluding tails which will move)
     /// - Doesn't reverse into the neck
+    /// - Avoids head-to-head collisions with equal or longer snakes (unless no other option)
     fn generate_legal_moves(board: &Board, snake: &Battlesnake, config: &Config) -> Vec<Direction> {
         if snake.health <= 0 || snake.body.is_empty() {
             return vec![];
@@ -502,7 +503,8 @@ impl Bot {
             None
         };
 
-        Direction::all()
+        // First, generate all moves that pass basic collision checks
+        let basic_legal_moves: Vec<Direction> = Direction::all()
             .iter()
             .filter(|&&dir| {
                 let next = dir.apply(&head);
@@ -527,7 +529,25 @@ impl Bot {
                 true
             })
             .copied()
-            .collect()
+            .collect();
+
+        // Now filter out dangerous head-to-head positions
+        let safe_moves: Vec<Direction> = basic_legal_moves
+            .iter()
+            .filter(|&&dir| {
+                let next = dir.apply(&head);
+                !Self::is_dangerous_head_to_head(&next, snake, board)
+            })
+            .copied()
+            .collect();
+
+        // If we have safe moves, use them. Otherwise, fall back to basic legal moves
+        // (better to risk a head-to-head than to definitely die)
+        if !safe_moves.is_empty() {
+            safe_moves
+        } else {
+            basic_legal_moves
+        }
     }
 
     /// Checks if a coordinate is out of bounds
@@ -547,6 +567,34 @@ impl Bot {
                 return true;
             }
         }
+        false
+    }
+
+    /// Checks if moving to a position could result in a dangerous head-to-head collision
+    /// Returns true if any opponent snake head is adjacent and could collide with us,
+    /// AND that opponent is equal or longer length (meaning we would lose or tie)
+    fn is_dangerous_head_to_head(position: &Coord, our_snake: &Battlesnake, board: &Board) -> bool {
+        for opponent in &board.snakes {
+            // Skip ourselves and dead snakes
+            if opponent.id == our_snake.id || opponent.health <= 0 || opponent.body.is_empty() {
+                continue;
+            }
+
+            let opp_head = opponent.body[0];
+
+            // Check if opponent head is adjacent to our target position
+            // Adjacent means Manhattan distance of 1
+            let distance = Self::manhattan_distance(*position, opp_head);
+
+            if distance == 1 {
+                // Opponent is adjacent and could move to collide with us
+                // This is dangerous if they're equal or longer length
+                if opponent.length >= our_snake.length {
+                    return true;
+                }
+            }
+        }
+
         false
     }
 
