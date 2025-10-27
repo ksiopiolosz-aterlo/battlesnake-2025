@@ -38,13 +38,13 @@ pub fn start(bot: &rocket::State<Bot>, start_req: Json<GameState>) -> Status {
 /// POST /move endpoint
 /// Called each turn to compute and return the next move
 #[post("/move", format = "json", data = "<move_req>")]
-pub fn get_move(bot: &rocket::State<Bot>, move_req: Json<GameState>) -> Json<Value> {
+pub async fn get_move(bot: &rocket::State<Bot>, move_req: Json<GameState>) -> Json<Value> {
     let response = bot.get_move(
         &move_req.game,
         &move_req.turn,
         &move_req.board,
         &move_req.you,
-    );
+    ).await;
 
     Json(response)
 }

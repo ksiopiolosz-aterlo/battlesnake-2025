@@ -14,7 +14,7 @@ pub struct Game {
 }
 
 /// Board state including dimensions, food, snakes, and hazards
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Board {
     pub height: u32,
     pub width: i32,

@@ -11,12 +11,49 @@
 // For more info see docs.battlesnake.com
 
 use log::info;
-use rand::seq::IndexedRandom;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::types::{Battlesnake, Board, Coord, Direction, Game};
+
+/// Execution strategy based on game state and hardware
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionStrategy {
+    /// Sequential execution for single-core or simple cases
+    Sequential,
+    /// Parallel 1v1 using alpha-beta pruning
+    Parallel1v1,
+    /// Parallel multiplayer using MaxN
+    ParallelMultiplayer,
+}
+
+/// Lock-free shared state for communication between async poller and computation engine
+#[derive(Debug)]
+struct SharedSearchState {
+    /// Best move found so far (encoded as direction index)
+    best_move: Arc<AtomicU8>,
+    /// Best score for our snake
+    best_score: Arc<AtomicI32>,
+    /// Flag indicating search completion
+    search_complete: Arc<AtomicBool>,
+    /// Current search depth being explored
+    current_depth: Arc<AtomicU8>,
+}
+
+impl SharedSearchState {
+    /// Creates a new shared state with default initial values
+    fn new() -> Self {
+        SharedSearchState {
+            best_move: Arc::new(AtomicU8::new(0)), // Default to Up
+            best_score: Arc::new(AtomicI32::new(i32::MIN)),
+            search_complete: Arc::new(AtomicBool::new(false)),
+            current_depth: Arc::new(AtomicU8::new(0)),
+        }
+    }
+}
 
 /// Battlesnake Bot with OOP-style API
 /// Takes static configuration dependencies and exposes methods corresponding to API endpoints
@@ -59,157 +96,270 @@ impl Bot {
         info!("GAME OVER");
     }
 
-    /// Computes and returns the next move
+    /// Computes and returns the next move using MaxN search with iterative deepening
     /// Corresponds to POST /move endpoint
     ///
+    /// This method orchestrates the async polling and CPU-bound search computation:
+    /// 1. Spawns background search on rayon thread pool
+    /// 2. Polls for results with timeout management
+    /// 3. Returns best move found within time budget (anytime property)
+    ///
     /// # Arguments
-    /// * `game` - Current game metadata
+    /// * `_game` - Current game metadata
     /// * `turn` - Current turn number
     /// * `board` - Current board state
     /// * `you` - Your snake's current state
     ///
     /// # Returns
     /// * `Value` - JSON response containing the chosen move direction
-    pub fn get_move(&self, _game: &Game, turn: &i32, board: &Board, you: &Battlesnake) -> Value {
-        let safe_moves: Vec<Direction> = self
-            .get_safe_moves(board, you)
-            .into_iter()
-            .filter(|&(_, v)| v)
-            .map(|(k, _)| k)
-            .collect();
+    pub async fn get_move(
+        &self,
+        _game: &Game,
+        turn: &i32,
+        board: &Board,
+        you: &Battlesnake,
+    ) -> Value {
+        let start_time = Instant::now();
 
-        // Choose a random move from the safe ones
-        // If no safe moves exist, pick any move (we're likely going to die anyway)
-        let chosen = if safe_moves.is_empty() {
-            info!("WARNING: No safe moves available, choosing default move");
-            Direction::Up
-        } else {
-            *safe_moves.choose(&mut rand::rng()).unwrap()
-        };
+        info!("Turn {}: Computing move", turn);
 
-        // TODO: Step 4 - Move towards food instead of random, to regain health and survive longer
-        // let food = &board.food;
+        // Create shared state for lock-free communication between poller and search
+        let shared = Arc::new(SharedSearchState::new());
+        let shared_clone = shared.clone();
 
-        info!("MOVE {}: {}", turn, chosen.as_str());
-        json!({ "move": chosen.as_str() })
-    }
+        // Clone data needed for the blocking task
+        let board = board.clone();
+        let you = you.clone();
+        let config = self.config.clone();
 
-    /// Computes a HashMap of moves marking each as safe or unsafe
-    ///
-    /// # Arguments
-    /// * `board` - Current board state
-    /// * `you` - Your snake's current state
-    ///
-    /// # Returns
-    /// * `HashMap<Direction, bool>` - Map of all directions with safety status
-    fn get_safe_moves(&self, board: &Board, you: &Battlesnake) -> HashMap<Direction, bool> {
-        // Initialize all moves as safe
-        let mut is_move_safe: HashMap<Direction, bool> =
-            Direction::all().iter().map(|&dir| (dir, true)).collect();
+        // Spawn CPU-bound computation on rayon thread pool
+        tokio::task::spawn_blocking(move || {
+            Bot::compute_best_move_internal(&board, &you, shared_clone, start_time, &config)
+        });
 
-        let my_head = &you.body[0]; // Coordinates of your head
-        let my_body = &you.body;
-        let body_tail_offset = self.config.move_generation.body_tail_offset;
+        // Polling loop: check for results or timeout
+        let effective_budget = self.config.timing.effective_budget_ms();
+        let polling_interval = Duration::from_millis(self.config.timing.polling_interval_ms);
 
-        // Prevent moving backwards into neck
-        Self::avoid_neck_moves(
-            &mut is_move_safe,
-            my_head,
-            my_body,
-            self.config.move_generation.snake_min_body_length_for_neck,
+        loop {
+            tokio::time::sleep(polling_interval).await;
+
+            let elapsed = start_time.elapsed().as_millis() as u64;
+
+            // Check if we've exceeded our time budget or search is complete
+            if elapsed >= effective_budget || shared.search_complete.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        // Extract results from shared state
+        let chosen_move =
+            Self::index_to_direction(shared.best_move.load(Ordering::Acquire), &self.config);
+        let final_score = shared.best_score.load(Ordering::Acquire);
+        let final_depth = shared.current_depth.load(Ordering::Acquire);
+
+        info!(
+            "Turn {}: Chose {} (score: {}, depth: {}, time: {}ms)",
+            turn,
+            chosen_move.as_str(),
+            final_score,
+            final_depth,
+            start_time.elapsed().as_millis()
         );
 
-        // Step 1: Prevent moving out of bounds
-        Self::avoid_boundary_collisions(&mut is_move_safe, my_head, board.width, board.height);
-
-        // Step 2: Prevent colliding with own body
-        Self::avoid_self_collisions(&mut is_move_safe, my_head, my_body, body_tail_offset);
-
-        // Step 3: Prevent colliding with other snakes
-        let opponents: Vec<Battlesnake> = board
-            .snakes
-            .iter()
-            .filter(|snake| snake.id != you.id)
-            .cloned()
-            .collect();
-
-        Self::avoid_opponent_collisions(&mut is_move_safe, my_head, &opponents, body_tail_offset);
-
-        is_move_safe
+        json!({ "move": chosen_move.as_str() })
     }
 
-    /// Marks moves that would cause the snake to move backwards into its own neck as unsafe
-    fn avoid_neck_moves(
-        is_move_safe: &mut HashMap<Direction, bool>,
-        my_head: &Coord,
-        my_body: &[Coord],
-        min_body_length: usize,
+    /// Internal computation engine - runs on rayon thread pool
+    /// Performs iterative deepening MaxN search with time management
+    fn compute_best_move_internal(
+        board: &Board,
+        you: &Battlesnake,
+        shared: Arc<SharedSearchState>,
+        start_time: Instant,
+        config: &Config,
     ) {
-        // Only check neck if snake has more than minimum body length
-        if my_body.len() <= min_body_length {
+        info!("Starting MaxN search computation");
+
+        // Determine execution strategy
+        let num_alive_snakes = board.snakes.iter().filter(|s| s.health > 0).count();
+        let num_cpus = rayon::current_num_threads();
+
+        let strategy = Self::determine_strategy(num_alive_snakes, num_cpus, config);
+        info!(
+            "Selected strategy: {:?} (snakes={}, cpus={})",
+            strategy, num_alive_snakes, num_cpus
+        );
+
+        // Iterative deepening loop
+        let mut current_depth = config.timing.initial_depth;
+        let effective_budget = config.timing.effective_budget_ms();
+
+        loop {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            let remaining = effective_budget.saturating_sub(elapsed);
+
+            // Check if we have enough time for another iteration
+            if remaining < config.timing.min_time_remaining_ms {
+                info!(
+                    "Stopping search: insufficient time remaining ({}ms)",
+                    remaining
+                );
+                break;
+            }
+
+            // Estimate time for next iteration
+            let estimated_time =
+                Self::estimate_iteration_time(current_depth, num_alive_snakes, config);
+            if estimated_time > remaining {
+                info!("Stopping search: next iteration would exceed budget (estimated {}ms, remaining {}ms)",
+                      estimated_time, remaining);
+                break;
+            }
+
+            // Safety cap on depth
+            if current_depth > config.timing.max_search_depth {
+                info!("Stopping search: reached max depth ({})", current_depth);
+                break;
+            }
+
+            info!("Starting iteration at depth {}", current_depth);
+            shared.current_depth.store(current_depth, Ordering::Release);
+
+            // Execute search based on strategy
+            match strategy {
+                ExecutionStrategy::Parallel1v1 => {
+                    info!(
+                        "TODO: parallel_1v1_search not yet implemented, using sequential fallback"
+                    );
+                    Self::sequential_search(board, you, current_depth, &shared, config);
+                }
+                ExecutionStrategy::ParallelMultiplayer => {
+                    info!("TODO: parallel_multiplayer_search not yet implemented, using sequential fallback");
+                    Self::sequential_search(board, you, current_depth, &shared, config);
+                }
+                ExecutionStrategy::Sequential => {
+                    Self::sequential_search(board, you, current_depth, &shared, config);
+                }
+            }
+
+            current_depth += 1;
+        }
+
+        shared.search_complete.store(true, Ordering::Release);
+        info!(
+            "Search complete. Best move: {:?}, Score: {}",
+            Self::index_to_direction(shared.best_move.load(Ordering::Acquire), config).as_str(),
+            shared.best_score.load(Ordering::Acquire)
+        );
+    }
+
+    /// Determines the execution strategy based on game state and hardware
+    fn determine_strategy(
+        num_snakes: usize,
+        num_cpus: usize,
+        config: &Config,
+    ) -> ExecutionStrategy {
+        match (num_snakes, num_cpus) {
+            (n, cpus)
+                if n == config.strategy.min_snakes_for_1v1
+                    && cpus >= config.strategy.min_cpus_for_parallel =>
+            {
+                ExecutionStrategy::Parallel1v1
+            }
+            (_, cpus) if cpus >= config.strategy.min_cpus_for_parallel => {
+                ExecutionStrategy::ParallelMultiplayer
+            }
+            _ => ExecutionStrategy::Sequential,
+        }
+    }
+
+    /// Estimates the time required for an iteration at a given depth
+    /// Uses exponential branching model: time ≈ base * branching_factor^(depth * num_snakes)
+    fn estimate_iteration_time(depth: u8, num_snakes: usize, config: &Config) -> u64 {
+        let exponent = (depth as f64) * (num_snakes as f64);
+        let estimate = config.time_estimation.base_iteration_time_ms
+            * config.time_estimation.branching_factor.powf(exponent);
+        estimate.ceil() as u64
+    }
+
+    /// Sequential search implementation (works on any hardware)
+    fn sequential_search(
+        board: &Board,
+        you: &Battlesnake,
+        _depth: u8,
+        shared: &Arc<SharedSearchState>,
+        config: &Config,
+    ) {
+        // Generate legal moves for our snake
+        let legal_moves = Self::generate_legal_moves(board, you, config);
+
+        if legal_moves.is_empty() {
+            info!("No legal moves available");
+            shared.best_move.store(
+                config.direction_encoding.direction_up_index,
+                Ordering::Release,
+            );
+            shared.best_score.store(i32::MIN, Ordering::Release);
             return;
         }
 
-        let my_neck = &my_body[1]; // Coordinates of the "neck"
+        info!("Evaluating {} legal moves", legal_moves.len());
 
-        if my_neck.x < my_head.x {
-            // Neck is left of head, don't move left
-            is_move_safe.insert(Direction::Left, false);
-        } else if my_neck.x > my_head.x {
-            // Neck is right of head, don't move right
-            is_move_safe.insert(Direction::Right, false);
-        } else if my_neck.y < my_head.y {
-            // Neck is below head, don't move down
-            is_move_safe.insert(Direction::Down, false);
-        } else if my_neck.y > my_head.y {
-            // Neck is above head, don't move up
-            is_move_safe.insert(Direction::Up, false);
-        }
+        // For now, use simple heuristic: move towards closest food
+        // TODO: Replace with actual MaxN search
+        let chosen_move = Self::choose_move_towards_food(board, you, &legal_moves);
+
+        let move_idx = Self::direction_to_index(chosen_move, config);
+        let score = 1000; // Placeholder score
+
+        shared.best_move.store(move_idx, Ordering::Release);
+        shared.best_score.store(score, Ordering::Release);
     }
 
-    /// Marks moves that would cause the snake to move out of bounds as unsafe
-    fn avoid_boundary_collisions(
-        is_move_safe: &mut HashMap<Direction, bool>,
-        my_head: &Coord,
-        board_width: i32,
-        board_height: u32,
-    ) {
-        for direction in Direction::all() {
-            let next_pos = direction.apply(my_head);
-            if Self::is_out_of_bounds(&next_pos, board_width, board_height) {
-                is_move_safe.insert(direction, false);
-            }
+    /// Generates all legal moves for a snake
+    /// A move is legal if it:
+    /// - Doesn't go out of bounds
+    /// - Doesn't collide with snake bodies (excluding tails which will move)
+    /// - Doesn't reverse into the neck
+    fn generate_legal_moves(board: &Board, snake: &Battlesnake, config: &Config) -> Vec<Direction> {
+        if snake.health <= 0 || snake.body.is_empty() {
+            return vec![];
         }
-    }
 
-    /// Marks moves that would cause the snake to collide with itself as unsafe
-    fn avoid_self_collisions(
-        is_move_safe: &mut HashMap<Direction, bool>,
-        my_head: &Coord,
-        my_body: &[Coord],
-        body_tail_offset: usize,
-    ) {
-        for direction in Direction::all() {
-            let next_pos = direction.apply(my_head);
-            if Self::is_self_collision(&next_pos, my_body, body_tail_offset) {
-                is_move_safe.insert(direction, false);
-            }
-        }
-    }
+        let head = snake.body[0];
+        let neck = if snake.body.len() > config.move_generation.snake_min_body_length_for_neck {
+            Some(snake.body[1])
+        } else {
+            None
+        };
 
-    /// Marks moves that would cause the snake to collide with opponents as unsafe
-    fn avoid_opponent_collisions(
-        is_move_safe: &mut HashMap<Direction, bool>,
-        my_head: &Coord,
-        opponents: &[Battlesnake],
-        body_tail_offset: usize,
-    ) {
-        for direction in Direction::all() {
-            let next_pos = direction.apply(my_head);
-            if Self::is_opponent_collision(&next_pos, opponents, body_tail_offset) {
-                is_move_safe.insert(direction, false);
-            }
-        }
+        Direction::all()
+            .iter()
+            .filter(|&&dir| {
+                let next = dir.apply(&head);
+
+                // Can't reverse onto neck
+                if let Some(n) = neck {
+                    if next == n {
+                        return false;
+                    }
+                }
+
+                // Must stay in bounds
+                if Self::is_out_of_bounds(&next, board.width, board.height) {
+                    return false;
+                }
+
+                // Can't collide with bodies (excluding tails which will move)
+                if Self::is_collision(&next, board, config.move_generation.body_tail_offset) {
+                    return false;
+                }
+
+                true
+            })
+            .copied()
+            .collect()
     }
 
     /// Checks if a coordinate is out of bounds
@@ -217,27 +367,80 @@ impl Bot {
         coord.x < 0 || coord.x >= board_width || coord.y < 0 || coord.y >= board_height as i32
     }
 
-    /// Checks if a coordinate collides with the snake's own body
-    /// Uses body_tail_offset to exclude the tail (which will move away)
-    fn is_self_collision(coord: &Coord, snake_body: &[Coord], body_tail_offset: usize) -> bool {
-        // Check against body segments, excluding the tail which will move
-        let body_check_len = snake_body.len().saturating_sub(body_tail_offset);
-        snake_body[..body_check_len].contains(coord)
-    }
+    /// Checks if a coordinate collides with any snake body
+    fn is_collision(coord: &Coord, board: &Board, body_tail_offset: usize) -> bool {
+        for snake in &board.snakes {
+            if snake.health <= 0 {
+                continue;
+            }
 
-    /// Checks if a coordinate collides with any opponent snake's body
-    /// Uses body_tail_offset to exclude opponent tails (which will move away)
-    fn is_opponent_collision(
-        coord: &Coord,
-        opponents: &[Battlesnake],
-        body_tail_offset: usize,
-    ) -> bool {
-        for opponent in opponents {
-            let body_check_len = opponent.body.len().saturating_sub(body_tail_offset);
-            if opponent.body[..body_check_len].contains(coord) {
+            let body_check_len = snake.body.len().saturating_sub(body_tail_offset);
+            if snake.body[..body_check_len].contains(coord) {
                 return true;
             }
         }
         false
+    }
+
+    /// Simple heuristic: choose move that gets us closer to nearest food
+    /// This is a placeholder until full MaxN search is implemented
+    fn choose_move_towards_food(
+        board: &Board,
+        you: &Battlesnake,
+        legal_moves: &[Direction],
+    ) -> Direction {
+        if board.food.is_empty() || legal_moves.is_empty() {
+            return legal_moves[0];
+        }
+
+        let head = you.body[0];
+
+        // Find closest food
+        let closest_food = board
+            .food
+            .iter()
+            .min_by_key(|&&food| Self::manhattan_distance(head, food))
+            .copied()
+            .unwrap();
+
+        // Choose move that minimizes distance to closest food
+        legal_moves
+            .iter()
+            .min_by_key(|&&dir| {
+                let next = dir.apply(&head);
+                Self::manhattan_distance(next, closest_food)
+            })
+            .copied()
+            .unwrap_or(legal_moves[0])
+    }
+
+    /// Calculates Manhattan distance between two coordinates
+    fn manhattan_distance(a: Coord, b: Coord) -> i32 {
+        (a.x - b.x).abs() + (a.y - b.y).abs()
+    }
+
+    /// Converts a direction to its encoded index
+    fn direction_to_index(dir: Direction, config: &Config) -> u8 {
+        match dir {
+            Direction::Up => config.direction_encoding.direction_up_index,
+            Direction::Down => config.direction_encoding.direction_down_index,
+            Direction::Left => config.direction_encoding.direction_left_index,
+            Direction::Right => config.direction_encoding.direction_right_index,
+        }
+    }
+
+    /// Converts an encoded index to a direction
+    fn index_to_direction(idx: u8, config: &Config) -> Direction {
+        if idx == config.direction_encoding.direction_up_index {
+            Direction::Up
+        } else if idx == config.direction_encoding.direction_down_index {
+            Direction::Down
+        } else if idx == config.direction_encoding.direction_left_index {
+            Direction::Left
+        } else if idx == config.direction_encoding.direction_right_index {
+            Direction::Right
+        } else {
+            Direction::Up // Default fallback
+        }
     }
 }
