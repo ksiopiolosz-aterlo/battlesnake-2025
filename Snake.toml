@@ -156,6 +156,6 @@ terminal_state_threshold = 1
 # ============================================================================
 [debug]
 # Enable debug mode to log game states, moves, and turns to disk
-enabled = false
+enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "battlesnake_debug.jsonl"
+log_file_path = "1v1_scared_bot.jsonl"

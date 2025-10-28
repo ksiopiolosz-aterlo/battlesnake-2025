@@ -11,7 +11,13 @@
       "Bash(mkdir:*)",
       "Read(//tmp/**)",
       "Bash(bash)",
-      "Bash(cargo clean:*)"
+      "Bash(cargo clean:*)",
+      "Bash(for:*)",
+      "Bash(do echo \"=== Game $i ===\")",
+      "Bash(tail:*)",
+      "Bash(python3:*)",
+      "Bash(done)",
+      "Bash(do echo \"Game $i:\")"
     ],
     "deny": [],
     "ask": []
