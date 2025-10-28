@@ -158,4 +158,4 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "1v1_scared_bot.jsonl"
+log_file_path = "1v1_loopy_bot.jsonl"
