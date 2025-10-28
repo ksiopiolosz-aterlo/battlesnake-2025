@@ -39,9 +39,11 @@ branching_factor = 3.25
 # Base time for iteration estimation in milliseconds
 base_iteration_time_ms = 0.01
 # Exponential branching factor for time estimation
-# Higher value (4.0) = more conservative until we have battle royale data
-# Will tune after collecting multiplayer performance metrics
-branching_factor = 4.0
+# Reduced from 4.0 to 2.25 to enable deeper search in battle royale
+# IDAPOS locality masking means only 1-2 snakes are active at shallow depths
+# This allows depth 2-3 search: 0.01 * 2.25^12 = 112ms (well within 350ms budget)
+# TODO: Fix time estimation formula to account for IDAPOS dynamic snake counts
+branching_factor = 2.25
 
 # ============================================================================
 # Strategy Selection Constants
@@ -173,4 +175,4 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "1v1_self.jsonl"
+log_file_path = "battle_royale_hungry_bot.jsonl"
