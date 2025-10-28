@@ -73,8 +73,6 @@ default_food_distance = 999
 health_max = 100.0
 # Base penalty for imminent starvation
 score_starvation_base = -50000
-# Distance threshold for considering opponent health in food urgency (death dance escape)
-health_threat_distance = 3
 
 # Space Control Constants
 # Extra cells needed beyond snake length
@@ -160,4 +158,4 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "1v1_loopy_bot.jsonl"
+log_file_path = "1v1_self.jsonl"

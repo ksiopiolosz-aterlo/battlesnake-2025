@@ -17,7 +17,11 @@
       "Bash(tail:*)",
       "Bash(python3:*)",
       "Bash(done)",
-      "Bash(do echo \"Game $i:\")"
+      "Bash(do echo \"Game $i:\")",
+      "Bash(cargo run:*)",
+      "Bash(sort:*)",
+      "Bash(do echo \"=== $game ===\")",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []
