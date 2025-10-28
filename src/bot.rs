@@ -1258,6 +1258,46 @@ impl Bot {
         }
     }
 
+    /// Converts a 2-snake scenario to alpha-beta search and returns ScoreTuple
+    /// Used by IDAPOS when locality masking reduces game to 2 active snakes
+    fn alpha_beta_for_two_snakes(
+        board: &Board,
+        our_snake_id: &str,
+        depth: u8,
+        our_idx: usize,
+        opponent_idx: usize,
+        config: &Config,
+    ) -> ScoreTuple {
+        // Create a simplified 2-player board with only the active snakes
+        let mut simplified_board = board.clone();
+
+        // Mark all non-active snakes as dead
+        for (idx, snake) in simplified_board.snakes.iter_mut().enumerate() {
+            if idx != our_idx && idx != opponent_idx {
+                snake.health = 0;
+            }
+        }
+
+        // Use alpha-beta to get our score
+        let our_score = Self::alpha_beta_minimax(
+            &simplified_board,
+            our_snake_id,
+            depth,
+            i32::MIN,
+            i32::MAX,
+            true,
+            config,
+        );
+
+        // Create score tuple with our score and opponent's inverse
+        // In zero-sum approximation, opponent's score is -our_score
+        let mut scores = vec![i32::MIN; board.snakes.len()];
+        scores[our_idx] = our_score;
+        scores[opponent_idx] = -our_score;
+
+        ScoreTuple { scores }
+    }
+
     /// MaxN recursive search for multiplayer games
     /// Each player maximizes their own score component
     fn maxn_search(
@@ -1272,9 +1312,40 @@ impl Bot {
             return Self::evaluate_state(board, our_snake_id, config);
         }
 
-        // Check if current player is alive
+        let our_idx = board
+            .snakes
+            .iter()
+            .position(|s| &s.id == our_snake_id)
+            .unwrap_or(0);
+
+        // IDAPOS: Determine active (local) snakes to reduce branching
+        let active_snakes = Self::determine_active_snakes(board, our_snake_id, depth, config);
+
+        // If only 2 snakes are active and we're one of them, use alpha-beta
+        if active_snakes.len() == config.idapos.min_snakes_for_alpha_beta
+            && active_snakes.contains(&our_idx)
+        {
+            // Switch to alpha-beta for efficiency
+            let opponent_idx = active_snakes
+                .iter()
+                .find(|&&idx| idx != our_idx)
+                .copied()
+                .unwrap_or(0);
+
+            return Self::alpha_beta_for_two_snakes(
+                board,
+                our_snake_id,
+                depth,
+                our_idx,
+                opponent_idx,
+                config,
+            );
+        }
+
+        // Check if current player is alive and active
         if current_player_idx >= board.snakes.len()
             || board.snakes[current_player_idx].health <= 0
+            || !active_snakes.contains(&current_player_idx)
         {
             // Skip to next player
             let next = (current_player_idx + 1) % board.snakes.len();
@@ -1294,12 +1365,6 @@ impl Bot {
 
         let mut best_tuple =
             ScoreTuple::new_with_value(board.snakes.len(), i32::MIN);
-
-        let our_idx = board
-            .snakes
-            .iter()
-            .position(|s| &s.id == our_snake_id)
-            .unwrap_or(0);
 
         for mv in moves {
             let mut child_board = board.clone();
