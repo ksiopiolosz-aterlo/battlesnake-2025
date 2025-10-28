@@ -1292,7 +1292,13 @@ impl Bot {
 
     /// Computes attack potential score
     /// Awards points for length advantage near opponents and trapping opponents
-    fn compute_attack_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+    /// Uses cached flood fill results if available (P2: caching optimization)
+    fn compute_attack_score(
+        board: &Board,
+        snake_idx: usize,
+        config: &Config,
+        space_cache: &HashMap<usize, usize>,
+    ) -> i32 {
         if snake_idx >= board.snakes.len() {
             return 0;
         }
@@ -1318,8 +1324,11 @@ impl Bot {
                 }
             }
 
-            // Trap potential - opponent has limited space
-            let opp_space = Self::flood_fill_bfs(board, opponent.body[0], idx);
+            // Trap potential - opponent has limited space (use cache if available)
+            let opp_space = space_cache
+                .get(&idx)
+                .copied()
+                .unwrap_or_else(|| Self::flood_fill_bfs(board, opponent.body[0], idx));
             if opp_space < opponent.length as usize + config.scores.attack_trap_margin {
                 attack += config.scores.attack_trap_bonus;
             }
@@ -1440,6 +1449,19 @@ impl Bot {
         let num_snakes = board.snakes.len();
         let mut scores = vec![0i32; num_snakes];
 
+        // Pre-compute ALL flood fills once per evaluation (P2: caching optimization)
+        // This eliminates redundant computation in space + attack scores
+        let mut space_cache: HashMap<usize, usize> = HashMap::new();
+        for (idx, snake) in board.snakes.iter().enumerate() {
+            if snake.health > 0 && !snake.body.is_empty() {
+                // Only compute for active snakes (IDAPOS optimization)
+                let is_active = active_snakes.map_or(true, |active| active.contains(&idx));
+                if is_active {
+                    space_cache.insert(idx, Self::flood_fill_bfs(board, snake.body[0], idx));
+                }
+            }
+        }
+
         // Compute territory control ONCE for active snakes only (major optimization!)
         // If active_snakes is empty, processes all snakes. Otherwise, only processes filtered snakes.
         let control_map = if let Some(active) = active_snakes {
@@ -1465,9 +1487,17 @@ impl Bot {
             let survival = 0; // Alive = 0 penalty
             let health = Self::compute_health_score(board, idx, config);
 
-            // Only compute expensive space control for active snakes (IDAPOS optimization)
+            // Use cached flood fill result if available (P2: caching optimization)
             let space = if is_active {
-                Self::compute_space_score(board, idx, config)
+                space_cache.get(&idx).copied().map_or(0, |reachable| {
+                    let snake = &board.snakes[idx];
+                    let required = snake.length as usize + config.scores.space_safety_margin;
+                    if reachable < required {
+                        -((required as i32 - reachable as i32) * config.scores.space_shortage_penalty)
+                    } else {
+                        reachable as i32
+                    }
+                })
             } else {
                 0
             };
@@ -1486,7 +1516,7 @@ impl Bot {
             let length = snake.length * config.scores.weight_length;
 
             let attack = if is_active {
-                Self::compute_attack_score(board, idx, config)
+                Self::compute_attack_score(board, idx, config, &space_cache)
             } else {
                 0  // Skip expensive attack calculation for non-active snakes
             };
