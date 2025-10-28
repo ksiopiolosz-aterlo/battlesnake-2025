@@ -41,12 +41,32 @@ impl TimingConfig {
 /// Time estimation constants for iterative deepening
 #[derive(Debug, Deserialize, Clone)]
 pub struct TimeEstimationConfig {
+    pub one_vs_one: GameModeTimeEstimation,
+    pub multiplayer: GameModeTimeEstimation,
+}
+
+/// Time estimation parameters for a specific game mode
+#[derive(Debug, Deserialize, Clone)]
+pub struct GameModeTimeEstimation {
     pub base_iteration_time_ms: f64,
     pub branching_factor: f64,
-    /// Blending factor for adaptive estimation
-    /// 0.0 = pure empirical (100% observed), 1.0 = pure model (100% formula)
-    /// Recommended: 0.3-0.5 for balanced approach
-    pub model_weight: f64,
+}
+
+impl TimeEstimationConfig {
+    /// Gets the appropriate time estimation parameters based on number of alive snakes
+    ///
+    /// # Arguments
+    /// * `num_alive_snakes` - Number of snakes still alive in the game
+    ///
+    /// # Returns
+    /// Reference to the appropriate GameModeTimeEstimation
+    pub fn for_snake_count(&self, num_alive_snakes: usize) -> &GameModeTimeEstimation {
+        if num_alive_snakes == 2 {
+            &self.one_vs_one
+        } else {
+            &self.multiplayer
+        }
+    }
 }
 
 /// Strategy selection constants
@@ -175,9 +195,14 @@ impl Config {
                 max_search_depth: 20,
             },
             time_estimation: TimeEstimationConfig {
-                base_iteration_time_ms: 0.01,
-                branching_factor: 3.5,
-                model_weight: 0.4,
+                one_vs_one: GameModeTimeEstimation {
+                    base_iteration_time_ms: 0.01,
+                    branching_factor: 3.0,  // Aggressive: lots of unused budget in 1v1
+                },
+                multiplayer: GameModeTimeEstimation {
+                    base_iteration_time_ms: 0.01,
+                    branching_factor: 4.0,  // Conservative: no data yet
+                },
             },
             strategy: StrategyConfig {
                 min_snakes_for_1v1: 2,
@@ -289,10 +314,10 @@ mod tests {
         assert!(config.timing.max_search_depth > 0);
 
         // Test time estimation config
-        assert!(config.time_estimation.base_iteration_time_ms > 0.0);
-        assert!(config.time_estimation.branching_factor > 0.0);
-        assert!(config.time_estimation.model_weight >= 0.0);
-        assert!(config.time_estimation.model_weight <= 1.0);
+        assert!(config.time_estimation.one_vs_one.base_iteration_time_ms > 0.0);
+        assert!(config.time_estimation.one_vs_one.branching_factor > 0.0);
+        assert!(config.time_estimation.multiplayer.base_iteration_time_ms > 0.0);
+        assert!(config.time_estimation.multiplayer.branching_factor > 0.0);
 
         // Test strategy config
         assert!(config.strategy.min_snakes_for_1v1 > 0);

@@ -389,12 +389,8 @@ impl Bot {
             strategy, num_alive_snakes, num_cpus
         );
 
-        // Initialize adaptive time estimator
-        let mut time_estimator = AdaptiveTimeEstimator::new(
-            config.time_estimation.base_iteration_time_ms,
-            config.time_estimation.branching_factor,
-            config.time_estimation.model_weight,
-        );
+        // Get appropriate time estimation parameters based on number of alive snakes
+        let time_params = config.time_estimation.for_snake_count(num_alive_snakes);
 
         // Select search function based on strategy (constant for entire game)
         // This hoists the match outside the iterative deepening loop to save cycles
@@ -421,8 +417,11 @@ impl Bot {
                 break;
             }
 
-            // Estimate time for next iteration using adaptive estimator
-            let estimated_time = time_estimator.estimate(current_depth, num_alive_snakes);
+            // Estimate time for next iteration using exponential model
+            // time = base_time * (branching_factor ^ (depth * num_snakes))
+            let exponent = (current_depth as f64) * (num_alive_snakes as f64);
+            let estimated_time = (time_params.base_iteration_time_ms * time_params.branching_factor.powf(exponent)).ceil() as u64;
+
             if estimated_time > remaining {
                 info!("Stopping search: next iteration would exceed budget (estimated {}ms, remaining {}ms)",
                       estimated_time, remaining);
@@ -436,8 +435,8 @@ impl Bot {
             }
 
             info!(
-                "Starting iteration at depth {} (estimated time: {}ms)",
-                current_depth, estimated_time
+                "Starting iteration at depth {} (estimated time: {}ms, mode: {} snakes)",
+                current_depth, estimated_time, num_alive_snakes
             );
             shared.current_depth.store(current_depth, Ordering::Release);
 
@@ -448,12 +447,11 @@ impl Bot {
             search_fn(board, you, current_depth, &shared, config);
 
             // Record actual iteration time
-            let iteration_elapsed = iteration_start.elapsed().as_millis() as f64;
-            time_estimator.record_observation(current_depth, iteration_elapsed);
+            let iteration_elapsed = iteration_start.elapsed().as_millis() as u64;
 
             info!(
-                "Completed depth {} in {:.2}ms (estimated: {}ms)",
-                current_depth, iteration_elapsed, estimated_time
+                "Completed depth {} in {}ms (estimated: {}ms, diff: {}ms)",
+                current_depth, iteration_elapsed, estimated_time, iteration_elapsed as i64 - estimated_time as i64
             );
 
             current_depth += 1;

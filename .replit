@@ -33,10 +33,6 @@ waitForPort = 5000
 localPort = 5000
 externalPort = 80
 
-[[ports]]
-localPort = 43143
-externalPort = 3000
-
 [deployment]
 deploymentTarget = "vm"
 run = ["cargo", "run", "--bin", "starter-snake-rust", "--release"]

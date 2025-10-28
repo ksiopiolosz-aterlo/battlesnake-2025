@@ -21,14 +21,26 @@ max_search_depth = 20
 # ============================================================================
 # Time Estimation Constants
 # ============================================================================
-[time_estimation]
+# Separate parameters for 1v1 and multiplayer (battle royale) scenarios
+# These are automatically selected based on number of alive snakes
+
+[time_estimation.one_vs_one]
 # Base time for iteration estimation in milliseconds
 base_iteration_time_ms = 0.01
 # Exponential branching factor for time estimation
-branching_factor = 3.5
-# Blending factor for adaptive estimation (0.0 = pure empirical, 1.0 = pure model)
-# Recommended: 0.3-0.5 for balanced approach
-model_weight = 0.4
+# Lower value (3.0) = more aggressive, deeper search
+# Analysis: 1v1 data shows avg 111ms with 240ms unused (68% of budget)
+# 50 timeout instances exist but represent <0.3% of all moves
+# Trade-off: Accept occasional timeouts for much deeper average search
+branching_factor = 3.0
+
+[time_estimation.multiplayer]
+# Base time for iteration estimation in milliseconds
+base_iteration_time_ms = 0.01
+# Exponential branching factor for time estimation
+# Higher value (4.0) = more conservative until we have battle royale data
+# Will tune after collecting multiplayer performance metrics
+branching_factor = 4.0
 
 # ============================================================================
 # Strategy Selection Constants
