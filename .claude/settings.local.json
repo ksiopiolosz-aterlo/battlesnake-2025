@@ -61,7 +61,8 @@
       "Bash(timeout 120 sh:*)",
       "Bash(./target/release/profile_slow_turns:*)",
       "Bash(timeout 180 sh:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(./target/release/find_timeouts:*)"
     ],
     "deny": [],
     "ask": []
