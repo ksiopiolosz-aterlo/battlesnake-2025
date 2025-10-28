@@ -73,8 +73,6 @@ default_food_distance = 999
 health_max = 100.0
 # Base penalty for imminent starvation
 score_starvation_base = -50000
-# Distance threshold for considering health as a threat
-health_threat_distance = 5
 
 # Space Control Constants
 # Extra cells needed beyond snake length
