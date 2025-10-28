@@ -197,7 +197,7 @@ impl Config {
             time_estimation: TimeEstimationConfig {
                 one_vs_one: GameModeTimeEstimation {
                     base_iteration_time_ms: 0.01,
-                    branching_factor: 3.0,  // Aggressive: lots of unused budget in 1v1
+                    branching_factor: 3.25,  // Balanced: captures unused budget, minimizes timeouts
                 },
                 multiplayer: GameModeTimeEstimation {
                     base_iteration_time_ms: 0.01,

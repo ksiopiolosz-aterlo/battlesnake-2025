@@ -28,11 +28,12 @@ max_search_depth = 20
 # Base time for iteration estimation in milliseconds
 base_iteration_time_ms = 0.01
 # Exponential branching factor for time estimation
-# Lower value (3.0) = more aggressive, deeper search
+# Value 3.25 = balanced between depth and timeout risk
 # Analysis: 1v1 data shows avg 111ms with 240ms unused (68% of budget)
 # 50 timeout instances exist but represent <0.3% of all moves
-# Trade-off: Accept occasional timeouts for much deeper average search
-branching_factor = 3.0
+# API behavior: On timeout, continues previous move direction (not catastrophic)
+# Trade-off: 3.25 captures most unused budget while minimizing timeout risk
+branching_factor = 3.25
 
 [time_estimation.multiplayer]
 # Base time for iteration estimation in milliseconds
