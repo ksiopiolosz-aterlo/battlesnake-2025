@@ -150,3 +150,12 @@ health_on_food = 100
 health_loss_per_turn = 1
 # Max alive snakes for terminal state
 terminal_state_threshold = 1
+
+# ============================================================================
+# Debug Configuration
+# ============================================================================
+[debug]
+# Enable debug mode to log game states, moves, and turns to disk
+enabled = false
+# Path to debug log file (relative to working directory)
+log_file_path = "battlesnake_debug.jsonl"

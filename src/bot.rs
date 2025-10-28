@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::debug_logger::DebugLogger;
 use crate::types::{Battlesnake, Board, Coord, Direction, Game};
 
 /// N-tuple score representation for MaxN algorithm
@@ -151,20 +152,20 @@ impl AdaptiveTimeEstimator {
 
 /// Lock-free shared state for communication between async poller and computation engine
 #[derive(Debug)]
-struct SharedSearchState {
+pub struct SharedSearchState {
     /// Best move found so far (encoded as direction index)
-    best_move: Arc<AtomicU8>,
+    pub best_move: Arc<AtomicU8>,
     /// Best score for our snake
-    best_score: Arc<AtomicI32>,
+    pub best_score: Arc<AtomicI32>,
     /// Flag indicating search completion
-    search_complete: Arc<AtomicBool>,
+    pub search_complete: Arc<AtomicBool>,
     /// Current search depth being explored
-    current_depth: Arc<AtomicU8>,
+    pub current_depth: Arc<AtomicU8>,
 }
 
 impl SharedSearchState {
     /// Creates a new shared state with default initial values
-    fn new() -> Self {
+    pub fn new() -> Self {
         SharedSearchState {
             best_move: Arc::new(AtomicU8::new(0)), // Default to Up
             best_score: Arc::new(AtomicI32::new(i32::MIN)),
@@ -178,6 +179,7 @@ impl SharedSearchState {
 /// Takes static configuration dependencies and exposes methods corresponding to API endpoints
 pub struct Bot {
     config: Config,
+    debug_logger: Arc<tokio::sync::Mutex<Option<DebugLogger>>>,
 }
 
 impl Bot {
@@ -186,7 +188,25 @@ impl Bot {
     /// # Arguments
     /// * `config` - Static configuration that does not change during the bot's lifetime
     pub fn new(config: Config) -> Self {
-        Bot { config }
+        Bot {
+            config,
+            debug_logger: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Ensures the debug logger is initialized (lazy initialization)
+    /// This is called on the first move to avoid blocking during startup
+    async fn ensure_debug_logger_initialized(&self) {
+        let mut logger_guard = self.debug_logger.lock().await;
+        if logger_guard.is_none() {
+            if self.config.debug.enabled {
+                *logger_guard = Some(
+                    DebugLogger::new(true, &self.config.debug.log_file_path).await
+                );
+            } else {
+                *logger_guard = Some(DebugLogger::disabled());
+            }
+        }
     }
 
     /// Returns bot metadata and appearance
@@ -242,18 +262,21 @@ impl Bot {
 
         info!("Turn {}: Computing move", turn);
 
+        // Ensure debug logger is initialized (lazy initialization on first call)
+        self.ensure_debug_logger_initialized().await;
+
         // Create shared state for lock-free communication between poller and search
         let shared = Arc::new(SharedSearchState::new());
         let shared_clone = shared.clone();
 
         // Clone data needed for the blocking task
-        let board = board.clone();
+        let board_clone = board.clone();
         let you = you.clone();
         let config = self.config.clone();
 
         // Spawn CPU-bound computation on rayon thread pool
         tokio::task::spawn_blocking(move || {
-            Bot::compute_best_move_internal(&board, &you, shared_clone, start_time, &config)
+            Bot::compute_best_move_internal(&board_clone, &you, shared_clone, start_time, &config)
         });
 
         // Polling loop: check for results or timeout
@@ -286,12 +309,17 @@ impl Bot {
             start_time.elapsed().as_millis()
         );
 
+        // Fire-and-forget debug logging (non-blocking)
+        if let Some(logger) = self.debug_logger.lock().await.as_ref() {
+            logger.log_move(*turn, board.clone(), chosen_move);
+        }
+
         json!({ "move": chosen_move.as_str() })
     }
 
     /// Internal computation engine - runs on rayon thread pool
     /// Performs iterative deepening MaxN search with time management
-    fn compute_best_move_internal(
+    pub fn compute_best_move_internal(
         board: &Board,
         you: &Battlesnake,
         shared: Arc<SharedSearchState>,
@@ -637,7 +665,7 @@ impl Bot {
     }
 
     /// Converts an encoded index to a direction
-    fn index_to_direction(idx: u8, config: &Config) -> Direction {
+    pub fn index_to_direction(idx: u8, config: &Config) -> Direction {
         if idx == config.direction_encoding.direction_up_index {
             Direction::Up
         } else if idx == config.direction_encoding.direction_down_index {

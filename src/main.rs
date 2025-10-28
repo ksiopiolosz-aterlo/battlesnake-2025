@@ -7,7 +7,9 @@ use std::env;
 
 mod bot;
 mod config;
+mod debug_logger;
 mod handler;
+mod replay;
 mod types;
 
 #[launch]

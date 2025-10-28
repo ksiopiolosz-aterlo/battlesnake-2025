@@ -17,6 +17,7 @@ pub struct Config {
     pub player_indices: PlayerIndicesConfig,
     pub direction_encoding: DirectionEncodingConfig,
     pub game_rules: GameRulesConfig,
+    pub debug: DebugConfig,
 }
 
 /// Timing and performance constants
@@ -132,6 +133,13 @@ pub struct GameRulesConfig {
     pub terminal_state_threshold: usize,
 }
 
+/// Debug configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct DebugConfig {
+    pub enabled: bool,
+    pub log_file_path: String,
+}
+
 impl Config {
     /// Loads configuration from a TOML file
     ///
@@ -219,6 +227,10 @@ impl Config {
                 health_on_food: 100,
                 health_loss_per_turn: 1,
                 terminal_state_threshold: 1,
+            },
+            debug: DebugConfig {
+                enabled: false,
+                log_file_path: "battlesnake_debug.jsonl".to_string(),
             },
         }
     }

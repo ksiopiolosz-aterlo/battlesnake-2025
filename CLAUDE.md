@@ -996,3 +996,294 @@ Assume opponents prioritize:
 
 ## Compilation
 Please ensure all code changes are saved before attempting to compile. Unless otherwise stated, you should not attempt to compile via cargo and instead advise the user to do it
+
+---
+
+# Debug & Replay System
+
+## Debug Logging
+
+The bot includes a debug logging system that records game states and move decisions for post-game analysis.
+
+### Enabling Debug Mode
+
+Edit `Snake.toml`:
+```toml
+[debug]
+# Enable debug mode to log game states, moves, and turns to disk
+enabled = true
+# Path to debug log file (relative to working directory)
+log_file_path = "battlesnake_debug.jsonl"
+```
+
+### Debug Log Format
+
+Each line in the log file is a JSON object containing:
+- `turn`: Turn number (integer)
+- `chosen_move`: The move that was made (`"up"`, `"down"`, `"left"`, `"right"`)
+- `board`: Complete board state (all snakes, food, dimensions)
+- `timestamp`: ISO 8601 timestamp
+
+Example log entry:
+```json
+{"turn":5,"chosen_move":"right","board":{"height":11,"width":11,"food":[{"x":3,"y":7}],"snakes":[...],"hazards":[]},"timestamp":"2025-10-28T12:34:56.789Z"}
+```
+
+## Replay System
+
+The replay system re-runs the bot's algorithm on historical game states to validate decision-making and diagnose issues.
+
+### Replay CLI Tool
+
+Located at `src/bin/replay.rs`, provides a command-line interface for analyzing debug logs.
+
+#### Basic Usage
+
+```bash
+# Replay all turns from a log file
+cargo run --bin replay -- battlesnake_debug.jsonl --all
+
+# Replay specific turns
+cargo run --bin replay -- battlesnake_debug.jsonl --turns 5,10,15,20
+
+# Verbose output (shows details for each turn)
+cargo run --bin replay -- battlesnake_debug.jsonl --all --verbose
+
+# Use custom configuration
+cargo run --bin replay -- battlesnake_debug.jsonl --all --config custom_snake.toml
+```
+
+#### Validation Mode
+
+Validate that expected moves were made at specific turns:
+
+```bash
+# Single expected move per turn
+cargo run --bin replay -- battlesnake_debug.jsonl --validate 5:up,10:right,15:down
+
+# Multiple acceptable moves per turn (use | separator)
+cargo run --bin replay -- battlesnake_debug.jsonl --validate 5:up|left,10:right,15:down|left
+```
+
+This is useful for:
+- **Unit testing**: Validate bot behavior on known scenarios
+- **Regression testing**: Ensure algorithm changes don't break known-good decisions
+- **Bug reproduction**: Confirm fixes for specific problematic turns
+
+### Replay Output
+
+The replay tool generates a comprehensive report:
+
+```
+═══════════════════════════════════════════════════════════
+                    REPLAY REPORT
+═══════════════════════════════════════════════════════════
+Total Turns:    50
+Matches:        47 (94.0%)
+Mismatches:     3
+═══════════════════════════════════════════════════════════
+
+Average Search Depth:       5.2
+Average Computation Time:   245.3ms
+
+═══════════════════════════════════════════════════════════
+                  DETAILED MISMATCHES
+═══════════════════════════════════════════════════════════
+Turn 12: up → right (score: 1523, depth: 5, time: 287ms)
+Turn 28: left → down (score: -234, depth: 6, time: 301ms)
+Turn 45: right → up (score: 892, depth: 4, time: 189ms)
+```
+
+### Replay Analysis Workflow
+
+#### 1. Identify Problematic Games
+
+When your bot loses unexpectedly or makes poor decisions:
+1. Enable debug mode in `Snake.toml`
+2. Play the game (or replay from saved game state)
+3. Review the debug log
+
+#### 2. Analyze Decision Points
+
+```bash
+# Replay the entire game to find mismatches
+cargo run --bin replay -- battlesnake_debug.jsonl --all --verbose
+```
+
+Look for:
+- **Low match rates**: Indicates algorithm instability or randomness
+- **Critical turn mismatches**: Turns where a wrong move led to death
+- **Depth inconsistencies**: Turns where search didn't reach expected depth
+- **Timing issues**: Turns that exceeded time budget
+
+#### 3. Investigate Specific Turns
+
+```bash
+# Replay problematic turns with verbose output
+cargo run --bin replay -- battlesnake_debug.jsonl --turns 12,28,45 --verbose
+```
+
+The verbose output shows:
+- Original move vs replayed move
+- Evaluation score
+- Search depth achieved
+- Computation time
+
+#### 4. Create Test Cases
+
+For reproducible bugs, extract the problematic turn into a test case:
+
+```bash
+# Create a minimal test fixture
+cargo run --bin replay -- battlesnake_debug.jsonl --turns 28 > tests/fixtures/turn_28_test.jsonl
+
+# Validate the fix
+cargo run --bin replay -- tests/fixtures/turn_28_test.jsonl --validate 28:down
+```
+
+### Common Debugging Scenarios
+
+#### Scenario 1: "Why did my snake die?"
+
+1. Find the death turn in the log (last turn where snake is alive)
+2. Replay turns leading up to death:
+   ```bash
+   cargo run --bin replay -- game.jsonl --turns 45,46,47,48,49,50 --verbose
+   ```
+3. Look for mismatches or poor scores
+4. Examine board state at critical turns
+
+#### Scenario 2: "Algorithm seems non-deterministic"
+
+1. Replay the entire game multiple times:
+   ```bash
+   cargo run --bin replay -- game.jsonl --all
+   ```
+2. Check match rate:
+   - 100% = Fully deterministic
+   - <100% = Non-determinism (investigate time-based cutoffs, randomness, or race conditions)
+
+#### Scenario 3: "Code changes made things worse"
+
+1. Save logs before changes:
+   ```bash
+   cargo run --bin replay -- before.jsonl --all > before_results.txt
+   ```
+2. Make code changes
+3. Replay with new code:
+   ```bash
+   cargo run --bin replay -- before.jsonl --all > after_results.txt
+   ```
+4. Compare match rates and average scores
+
+#### Scenario 4: "Bot timeout on specific turns"
+
+1. Replay with verbose output:
+   ```bash
+   cargo run --bin replay -- game.jsonl --all --verbose | grep -A2 "time: [4-9][0-9][0-9]ms"
+   ```
+2. Identify turns with >400ms computation time
+3. Investigate board complexity (number of snakes, board size)
+4. Adjust timing parameters or improve pruning
+
+### Testing with Replay
+
+#### Unit Test Structure
+
+```rust
+#[test]
+fn test_simple_survival() {
+    let engine = ReplayEngine::new(Config::default_hardcoded(), false);
+    let entries = engine.load_log_file("tests/fixtures/simple_survival.jsonl").unwrap();
+
+    // Validate all expected moves
+    let expected = vec![
+        (0, vec![Direction::Right]),
+        (1, vec![Direction::Right]),
+        (2, vec![Direction::Down]),
+    ];
+
+    engine.validate_expected_moves(&entries, &expected).unwrap();
+}
+```
+
+#### Integration Test Strategy
+
+1. **Simple scenarios** (1-5 turns): Test basic survival and food gathering
+2. **Mid-game scenarios** (10-20 turns): Test strategic decision-making
+3. **End-game scenarios** (30+ turns): Test winning strategies
+4. **Adversarial scenarios**: Test head-to-head collision avoidance
+
+#### Test Fixture Guidelines
+
+Keep test fixtures simple and focused:
+- **Single concept per fixture**: Test one thing (survival, food, attack, etc.)
+- **Minimal board state**: Small boards (7x7 or 11x11)
+- **Few snakes**: 1-3 snakes maximum
+- **Clear expected outcomes**: Obvious correct moves
+
+Example fixture naming:
+```
+tests/fixtures/
+├── survival_basic.jsonl          # Simple wall avoidance
+├── survival_tight_space.jsonl    # Limited space survival
+├── food_near_wall.jsonl          # Food acquisition near boundary
+├── food_vs_survival.jsonl        # Trade-off between food and safety
+├── collision_head_to_head.jsonl  # Head-to-head collision avoidance
+└── trap_opponent.jsonl           # Offensive trapping scenario
+```
+
+### Replay Module API
+
+For programmatic use in tests:
+
+```rust
+use starter_snake_rust::config::Config;
+use starter_snake_rust::replay::ReplayEngine;
+
+let engine = ReplayEngine::new(Config::load_or_default(), false);
+
+// Load log file
+let entries = engine.load_log_file("game.jsonl")?;
+
+// Replay all turns
+let results = engine.replay_all(&entries)?;
+
+// Generate statistics
+let stats = engine.generate_stats(&results);
+println!("Match rate: {:.1}%", stats.match_rate);
+
+// Print detailed report
+engine.print_report(&results);
+
+// Validate specific moves
+let expected_moves = vec![
+    (5, vec![Direction::Up]),
+    (10, vec![Direction::Right, Direction::Down]), // Multiple acceptable
+];
+engine.validate_expected_moves(&entries, &expected_moves)?;
+```
+
+### Performance Considerations
+
+- **Replay is slower than live play**: No time pressure, runs synchronously
+- **Disable parallel replay for debugging**: Use verbose mode to see sequential execution
+- **Large log files**: Consider replaying specific turns rather than entire games
+- **Memory usage**: JSONL format allows streaming, but current implementation loads all into memory
+
+### Limitations
+
+1. **Configuration must match**: Replay uses current `Snake.toml` configuration
+2. **Non-deterministic elements**: Random tie-breaking will differ between runs
+3. **Time-dependent cutoffs**: Iterative deepening may reach different depths
+4. **Hardware differences**: Different CPU counts affect parallel strategy selection
+
+### Future Enhancements
+
+Potential improvements to the replay system:
+- Diff visualization showing board state changes
+- Score breakdown showing evaluation components
+- Move tree visualization for understanding search
+- Comparative replay (before/after code changes)
+- Performance profiling integration
+- Web-based replay viewer
