@@ -223,6 +223,19 @@ impl Bot {
 
         // Create shared state for lock-free communication between poller and search
         let shared = Arc::new(SharedSearchState::new());
+
+        // CRITICAL: Initialize shared state with first legal move to ensure we never
+        // return an illegal move if search times out before completing any iterations
+        let legal_moves = Self::generate_legal_moves(board, you, &self.config);
+        if !legal_moves.is_empty() {
+            let first_legal_move = legal_moves[0];
+            shared.try_update_best(
+                Self::direction_to_index(first_legal_move, &self.config),
+                i32::MIN + 1, // Slightly better than initial i32::MIN to ensure it updates
+            );
+        }
+        // If no legal moves, keep default (will be handled by fallback logic in compute_best_move_internal)
+
         let shared_clone = shared.clone();
 
         // Clone data needed for the blocking task
