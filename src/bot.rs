@@ -438,6 +438,7 @@ impl Bot {
         config: &Config,
     ) {
         info!("Starting MaxN search computation");
+        let init_start = Instant::now();
 
         // Create transposition table for this search
         // Size: 100k entries = ~1.6MB memory (16 bytes per entry)
@@ -465,6 +466,11 @@ impl Bot {
             ExecutionStrategy::Sequential => Self::sequential_search,
         };
 
+        let init_elapsed = init_start.elapsed().as_micros();
+        if simple_profiler::is_profiling_enabled() {
+            eprintln!("[PROFILE] Initialization: {}µs", init_elapsed);
+        }
+
         // Iterative deepening loop
         let mut current_depth = config.timing.initial_depth;
         let effective_budget = config.timing.effective_budget_ms();
@@ -473,23 +479,48 @@ impl Bot {
             let elapsed = start_time.elapsed().as_millis() as u64;
             let remaining = effective_budget.saturating_sub(elapsed);
 
+            if simple_profiler::is_profiling_enabled() {
+                eprintln!("[PROFILE] Loop iteration: depth={}, elapsed={}ms, remaining={}ms",
+                         current_depth, elapsed, remaining);
+            }
+
             // Check if we have enough time for another iteration
             if remaining < config.timing.min_time_remaining_ms {
                 info!(
                     "Stopping search: insufficient time remaining ({}ms)",
                     remaining
                 );
+                if simple_profiler::is_profiling_enabled() {
+                    eprintln!("[PROFILE] STOP REASON: Insufficient time ({}ms < {}ms min)",
+                             remaining, config.timing.min_time_remaining_ms);
+                }
                 break;
             }
 
+            // CRITICAL FIX: Use IDAPOS-filtered snake count for time estimation
+            // Previously used num_alive_snakes (all snakes), causing massive overestimation
+            let active_snakes = Self::determine_active_snakes(board, &you.id, current_depth, config);
+            let num_active_snakes = active_snakes.len();
+
             // Estimate time for next iteration using exponential model
             // time = base_time * (branching_factor ^ (depth * num_snakes))
-            let exponent = (current_depth as f64) * (num_alive_snakes as f64);
+            // Use IDAPOS-filtered count for accurate estimation
+            let exponent = (current_depth as f64) * (num_active_snakes as f64);
             let estimated_time = (time_params.base_iteration_time_ms * time_params.branching_factor.powf(exponent)).ceil() as u64;
+
+            if simple_profiler::is_profiling_enabled() {
+                eprintln!("[PROFILE] Time estimation: depth={}, snakes_total={}, snakes_active={} (IDAPOS), exponent={:.2}, base={:.3}ms, factor={:.2}, estimated={}ms",
+                         current_depth, num_alive_snakes, num_active_snakes, exponent,
+                         time_params.base_iteration_time_ms, time_params.branching_factor, estimated_time);
+            }
 
             if estimated_time > remaining {
                 info!("Stopping search: next iteration would exceed budget (estimated {}ms, remaining {}ms)",
                       estimated_time, remaining);
+                if simple_profiler::is_profiling_enabled() {
+                    eprintln!("[PROFILE] STOP REASON: Time estimate too high ({}ms > {}ms remaining)",
+                             estimated_time, remaining);
+                }
                 break;
             }
 
@@ -1738,9 +1769,20 @@ impl Bot {
             || board.snakes[current_player_idx].health <= 0
             || !active_snakes.contains(&current_player_idx)
         {
-            // Skip to next player
+            // Skip to next player (inactive snake passes their turn)
             let next = (current_player_idx + 1) % board.snakes.len();
-            return Self::maxn_search(board, our_snake_id, depth, next, config, tt);
+
+            // Check if we've completed a full round (cycled back to our snake)
+            if next == our_idx {
+                // All active snakes have moved, inactive snakes passed
+                // Advance game state and reduce depth
+                let mut advanced_board = board.clone();
+                Self::advance_game_state(&mut advanced_board);
+                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, our_idx, config, tt);
+            } else {
+                // Continue with next player at same depth
+                return Self::maxn_search(board, our_snake_id, depth, next, config, tt);
+            }
         }
 
         // Generate legal moves for current player
