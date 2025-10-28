@@ -114,6 +114,46 @@ These are tunable parameters (consider externalizing to a config file):
 3. Run static analysis tools to catch issues
 4. **Default behavior**: Do NOT generate tests unless explicitly requested
 
+## Tooling Philosophy
+
+**CRITICAL**: When building analysis, validation, or utility tools:
+
+- **Default to Rust**: ALWAYS implement new tools as Rust binaries in `src/bin/` rather than bash/python scripts
+- **Code Reuse**: Leverage existing modules (`src/types.rs`, `src/config.rs`, `src/replay.rs`, etc.)
+- **Type Safety**: Rust provides compile-time guarantees that scripts cannot
+- **Performance**: Rust tools run 10-100x faster than equivalent scripts
+- **Maintainability**: Rust tools integrate with the project's build system and IDE tooling
+
+### Examples of Correct Tooling Approach
+
+✅ **Good**: `src/bin/validate_moves.rs` - Rust binary that validates game logs
+✅ **Good**: `src/bin/regenerate_logs.rs` - Rust binary that replays games with fixed code
+✅ **Good**: `src/bin/analyze_fix.rs` - Rust binary that cross-references validation with replay
+
+❌ **Bad**: `validate_moves.sh` - Bash script with fragile text parsing
+❌ **Bad**: `analyze_fix.py` - Python script that duplicates type definitions
+
+### When to Use Bash
+
+Only use bash for:
+- **Simple orchestration**: Calling multiple Rust binaries in sequence
+- **Environment setup**: Setting environment variables before running tools
+- **One-liners**: Quick exploratory commands (not permanent tooling)
+
+### Tool Development Pattern
+
+```rust
+// src/bin/my_tool.rs
+use starter_snake_rust::config::Config;
+use starter_snake_rust::types::{Board, Game};
+use starter_snake_rust::replay::ReplayEngine;
+
+fn main() {
+    let config = Config::load_or_default();
+    // Tool implementation with full type safety and code reuse
+}
+```
+
 ## Build & Test Commands
 - **CRITICAL**: This environment has limited disk space. ALWAYS use `--release` flag for all cargo commands
 - **Build**: `cargo build --release`
