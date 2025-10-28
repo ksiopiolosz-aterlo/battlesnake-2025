@@ -13,6 +13,7 @@ pub struct Config {
     pub strategy: StrategyConfig,
     pub scores: ScoresConfig,
     pub idapos: IdaposConfig,
+    pub move_ordering: MoveOrderingConfig,
     pub move_generation: MoveGenerationConfig,
     pub player_indices: PlayerIndicesConfig,
     pub direction_encoding: DirectionEncodingConfig,
@@ -147,6 +148,14 @@ pub struct ScoresConfig {
 pub struct IdaposConfig {
     pub head_distance_multiplier: i32,
     pub min_snakes_for_alpha_beta: usize,
+}
+
+/// Move ordering constants
+#[derive(Debug, Deserialize, Clone)]
+pub struct MoveOrderingConfig {
+    pub killer_moves_per_depth: usize,
+    pub enable_pv_ordering: bool,
+    pub enable_killer_heuristic: bool,
 }
 
 /// Move generation constants
@@ -291,6 +300,11 @@ impl Config {
             idapos: IdaposConfig {
                 head_distance_multiplier: 2,
                 min_snakes_for_alpha_beta: 2,
+            },
+            move_ordering: MoveOrderingConfig {
+                killer_moves_per_depth: 2,
+                enable_pv_ordering: true,
+                enable_killer_heuristic: true,
             },
             move_generation: MoveGenerationConfig {
                 snake_min_body_length_for_neck: 1,

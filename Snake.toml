@@ -19,6 +19,17 @@ min_time_remaining_ms = 20
 max_search_depth = 20
 
 # ============================================================================
+# Move Ordering Constants
+# ============================================================================
+[move_ordering]
+# Number of killer moves to track per depth (standard is 2)
+killer_moves_per_depth = 2
+# Enable PV (Principal Variation) move ordering from previous iteration
+enable_pv_ordering = true
+# Enable killer move heuristic
+enable_killer_heuristic = true
+
+# ============================================================================
 # Time Estimation Constants
 # ============================================================================
 # Separate parameters for 1v1 and multiplayer (battle royale) scenarios

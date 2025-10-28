@@ -10,7 +10,7 @@
 // To get you started we've included code to prevent your Battlesnake from moving backwards.
 // For more info see docs.battlesnake.com
 
-use log::info;
+use log::{info, warn};
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -265,6 +265,14 @@ impl SharedSearchState {
         }
     }
 
+    /// Force-set the initial move and score without comparison
+    /// ONLY use this during initialization BEFORE search threads start
+    /// This prevents race conditions where search updates before initialization completes
+    pub fn force_initialize(&self, move_idx: u8, score: i32) {
+        let packed = Self::pack_move_score(move_idx, score);
+        self.best_move_and_score.store(packed, Ordering::Release);
+    }
+
     /// Gets the current best move and score atomically
     /// Returns (move_idx, score) as a tuple
     pub fn get_best(&self) -> (u8, i32) {
@@ -272,6 +280,107 @@ impl SharedSearchState {
         Self::unpack_move_score(packed)
     }
 
+}
+
+/// Killer Move Table for move ordering heuristic
+/// Tracks moves that caused alpha-beta cutoffs at each depth
+/// Used to improve move ordering and increase cutoff rate
+pub struct KillerMoveTable {
+    /// Two killer moves per depth (standard killer heuristic)
+    /// Array size is max_search_depth + 1 (config value: 20 + 1 = 21)
+    killers: Vec<Vec<Option<Direction>>>,
+}
+
+impl KillerMoveTable {
+    /// Creates a new killer move table
+    /// Size is determined by config.timing.max_search_depth
+    pub fn new(config: &Config) -> Self {
+        let max_depth = (config.timing.max_search_depth + 1) as usize;
+        let killer_count = config.move_ordering.killer_moves_per_depth;
+
+        KillerMoveTable {
+            killers: vec![vec![None; killer_count]; max_depth],
+        }
+    }
+
+    /// Records a killer move at a specific depth
+    /// Shifts existing killer moves down (most recent first)
+    pub fn record_killer(&mut self, depth: u8, mv: Direction, config: &Config) {
+        if !config.move_ordering.enable_killer_heuristic {
+            return;
+        }
+
+        let depth_idx = depth as usize;
+        if depth_idx >= self.killers.len() {
+            return;
+        }
+
+        // Check if this move is already a killer at this depth
+        if self.killers[depth_idx].iter().any(|k| k == &Some(mv)) {
+            return;
+        }
+
+        // Shift killers: [0] -> [1], [1] -> [2], etc.
+        // Insert new killer at position 0
+        self.killers[depth_idx].rotate_right(1);
+        self.killers[depth_idx][0] = Some(mv);
+    }
+
+    /// Checks if a move is a killer move at a specific depth
+    pub fn is_killer(&self, depth: u8, mv: Direction) -> bool {
+        let depth_idx = depth as usize;
+        if depth_idx >= self.killers.len() {
+            return false;
+        }
+        self.killers[depth_idx].contains(&Some(mv))
+    }
+
+    /// Clears all killer moves (called at start of new search iteration)
+    pub fn clear(&mut self) {
+        for depth_killers in &mut self.killers {
+            depth_killers.fill(None);
+        }
+    }
+}
+
+/// Orders moves for better alpha-beta pruning
+/// Priority: PV move > killer moves > remaining moves
+/// This can improve alpha-beta efficiency by 50-80%
+fn order_moves(
+    moves: Vec<Direction>,
+    pv_move: Option<Direction>,
+    killers: &KillerMoveTable,
+    depth: u8,
+    config: &Config,
+) -> Vec<Direction> {
+    let mut ordered = Vec::with_capacity(moves.len());
+
+    // Priority 1: PV (Principal Variation) move from previous iteration
+    if config.move_ordering.enable_pv_ordering {
+        if let Some(pv) = pv_move {
+            if moves.contains(&pv) {
+                ordered.push(pv);
+            }
+        }
+    }
+
+    // Priority 2: Killer moves
+    if config.move_ordering.enable_killer_heuristic {
+        for &mv in &moves {
+            if !ordered.contains(&mv) && killers.is_killer(depth, mv) {
+                ordered.push(mv);
+            }
+        }
+    }
+
+    // Priority 3: Remaining moves
+    for &mv in &moves {
+        if !ordered.contains(&mv) {
+            ordered.push(mv);
+        }
+    }
+
+    ordered
 }
 
 /// Battlesnake Bot with OOP-style API
@@ -367,17 +476,21 @@ impl Bot {
         // Create shared state for lock-free communication between poller and search
         let shared = Arc::new(SharedSearchState::new());
 
-        // CRITICAL: Initialize shared state with first legal move to ensure we never
-        // return an illegal move if search times out before completing any iterations
+        // CRITICAL: Initialize shared state with first legal move BEFORE spawning search
+        // Use force_initialize() to prevent race condition where search updates before init completes
+        // ALSO: Keep legal_moves for later validation (must do this before cloning `you`)
         let legal_moves = Self::generate_legal_moves(board, you, &self.config);
         if !legal_moves.is_empty() {
             let first_legal_move = legal_moves[0];
-            shared.try_update_best(
+            shared.force_initialize(
                 Self::direction_to_index(first_legal_move, &self.config),
-                i32::MIN + 1, // Slightly better than initial i32::MIN to ensure it updates
+                i32::MIN + 1, // Slightly better than initial i32::MIN
             );
+        } else {
+            // No legal moves - we're trapped, keep default
+            // (will be handled by fallback logic in compute_best_move_internal)
+            warn!("No legal moves available at turn {}", turn);
         }
-        // If no legal moves, keep default (will be handled by fallback logic in compute_best_move_internal)
 
         let shared_clone = shared.clone();
 
@@ -411,10 +524,21 @@ impl Bot {
         let chosen_move = Self::index_to_direction(best_move_idx, &self.config);
         let final_depth = shared.current_depth.load(Ordering::Acquire);
 
+        // DEFENSIVE: Validate chosen move is actually legal (catches any remaining edge cases)
+        let final_move = if legal_moves.contains(&chosen_move) {
+            chosen_move
+        } else {
+            warn!(
+                "Turn {}: ILLEGAL MOVE DETECTED! Chose {} but legal moves are {:?}. Falling back to first legal move.",
+                turn, chosen_move.as_str(), legal_moves
+            );
+            legal_moves.first().copied().unwrap_or(Direction::Up)
+        };
+
         info!(
             "Turn {}: Chose {} (score: {}, depth: {}, time: {}ms)",
             turn,
-            chosen_move.as_str(),
+            final_move.as_str(),
             final_score,
             final_depth,
             start_time.elapsed().as_millis()
@@ -422,10 +546,10 @@ impl Bot {
 
         // Fire-and-forget debug logging (non-blocking)
         if let Some(logger) = self.debug_logger.lock().await.as_ref() {
-            logger.log_move(*turn, board.clone(), chosen_move);
+            logger.log_move(*turn, board.clone(), final_move);
         }
 
-        json!({ "move": chosen_move.as_str() })
+        json!({ "move": final_move.as_str() })
     }
 
     /// Internal computation engine - runs on rayon thread pool
@@ -999,7 +1123,7 @@ impl Bot {
     /// Flood fill BFS to count reachable cells from a starting position
     /// Accounts for snake bodies that will move over time
     /// Returns the number of cells reachable
-    fn flood_fill_bfs(board: &Board, start: Coord, snake_idx: usize) -> usize {
+    fn flood_fill_bfs(board: &Board, start: Coord, _snake_idx: usize) -> usize {
         let _prof = simple_profiler::ProfileGuard::new("flood_fill");
 
         // Pre-build obstacle map for O(1) lookups (huge performance improvement)
@@ -1051,6 +1175,66 @@ impl Bot {
         }
 
         visited.len()
+    }
+
+    /// Enhanced flood fill that returns distance information for entrapment detection
+    /// Returns (total_cells, distance_map) where distance_map tracks turns to reach each cell
+    fn flood_fill_with_distances(
+        board: &Board,
+        start: Coord,
+        _snake_idx: usize,
+    ) -> (usize, HashMap<Coord, usize>) {
+        let _prof = simple_profiler::ProfileGuard::new("flood_fill_with_distances");
+
+        // Pre-build obstacle map for O(1) lookups
+        let mut obstacles: HashMap<Coord, usize> = HashMap::new();
+        for snake in &board.snakes {
+            if snake.health <= 0 {
+                continue;
+            }
+            for (seg_idx, &segment) in snake.body.iter().enumerate() {
+                let segments_from_tail = snake.body.len() - seg_idx;
+                obstacles.insert(segment, segments_from_tail);
+            }
+        }
+
+        let mut distance_map = HashMap::new();
+        let mut queue = VecDeque::new();
+
+        queue.push_back((start, 0)); // (position, turns_elapsed)
+        distance_map.insert(start, 0);
+
+        while let Some((pos, turns)) = queue.pop_front() {
+            for dir in Direction::all().iter() {
+                let next = dir.apply(&pos);
+
+                // Check bounds
+                if next.x < 0
+                    || next.x >= board.width
+                    || next.y < 0
+                    || next.y >= board.height as i32
+                {
+                    continue;
+                }
+
+                if distance_map.contains_key(&next) {
+                    continue;
+                }
+
+                // Check if blocked using pre-built obstacle map
+                if let Some(&segments_from_tail) = obstacles.get(&next) {
+                    if segments_from_tail > turns {
+                        continue; // Still blocked
+                    }
+                }
+
+                distance_map.insert(next, turns + 1);
+                queue.push_back((next, turns + 1));
+            }
+        }
+
+        let total = distance_map.len();
+        (total, distance_map)
     }
 
     /// Checks if a position will be blocked at a future turn
@@ -1233,11 +1417,20 @@ impl Bot {
             .unwrap_or(config.scores.default_food_distance);
 
         // Urgency increases as health decreases
-        let urgency = (config.scores.health_max - snake.health as f32) / config.scores.health_max;
+        // Length-aware: longer snakes need to plan further ahead (more body to navigate)
+        let base_urgency = (config.scores.health_max - snake.health as f32) / config.scores.health_max;
+        let length_multiplier = (config.scores.health_urgency_min_multiplier +
+            ((snake.length as f32 - config.scores.health_urgency_base_length) *
+             config.scores.health_urgency_length_multiplier))
+            .min(config.scores.health_urgency_max_multiplier)
+            .max(config.scores.health_urgency_min_multiplier);
+        let urgency = base_urgency * length_multiplier;
         let distance_penalty = -(nearest_food_dist as f32 * urgency) as i32;
 
         // Critical: will starve before reaching food
-        if snake.health <= nearest_food_dist {
+        // Add buffer for longer snakes - they need more turns to maneuver around their body
+        let starvation_buffer = (snake.length as i32 / config.scores.starvation_buffer_divisor).max(0);
+        if snake.health as i32 <= nearest_food_dist + starvation_buffer {
             return config.scores.score_starvation_base + distance_penalty;
         }
 
@@ -1277,7 +1470,13 @@ impl Bot {
 
     /// Computes space control score - how many cells are reachable
     /// Penalizes cramped positions that could lead to being trapped
-    fn compute_space_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+    /// Uses IDAPOS-filtered active_snakes list for adversarial entrapment detection
+    fn compute_space_score(
+        board: &Board,
+        snake_idx: usize,
+        active_snakes: &[usize],
+        config: &Config,
+    ) -> i32 {
         if snake_idx >= board.snakes.len() {
             return -(config.scores.space_safety_margin as i32)
                 * config.scores.space_shortage_penalty;
@@ -1289,14 +1488,102 @@ impl Bot {
                 * config.scores.space_shortage_penalty;
         }
 
-        let reachable = Self::flood_fill_bfs(board, snake.body[0], snake_idx);
+        // Get reachable cells with distance information
+        let (reachable, distance_map) = Self::flood_fill_with_distances(board, snake.body[0], snake_idx);
         let required = snake.length as usize + config.scores.space_safety_margin;
 
         if reachable < required {
             return -((required as i32 - reachable as i32) * config.scores.space_shortage_penalty);
         }
 
-        reachable as i32
+        // Detect tight spaces / narrow corridors (entrapment risk)
+        // If most cells are far away, we're in a narrow corridor that could trap us
+        let nearby_threshold = (snake.length.min(config.scores.entrapment_nearby_threshold as i32)) as usize;
+        let nearby_cells = distance_map.iter().filter(|(_, &dist)| dist <= nearby_threshold).count();
+        let compactness_ratio = nearby_cells as f32 / reachable as f32;
+
+        // Penalty for narrow spaces based on compactness ratio thresholds
+        let entrapment_penalty = if compactness_ratio < config.scores.entrapment_severe_threshold {
+            // Severe penalty: likely in a narrow corridor
+            -((reachable as f32 * config.scores.entrapment_severe_penalty_multiplier) as i32)
+        } else if compactness_ratio < config.scores.entrapment_moderate_threshold {
+            // Moderate penalty: somewhat confined
+            -((reachable as f32 * config.scores.entrapment_moderate_penalty_multiplier) as i32)
+        } else {
+            0
+        };
+
+        // Adversarial Entrapment: Detect if opponents are actively trapping us
+        // Use pre-computed IDAPOS active_snakes list for efficiency
+        let adversarial_penalty = Self::compute_adversarial_entrapment_penalty(
+            board,
+            snake_idx,
+            reachable,
+            active_snakes,
+            config
+        );
+
+        reachable as i32 + entrapment_penalty + adversarial_penalty
+    }
+
+    /// Detects if nearby opponents are actively reducing our space (adversarial entrapment)
+    /// Returns penalty if opponent movements would significantly cut our accessible area
+    /// Uses pre-computed IDAPOS active_snakes list for maximum efficiency
+    fn compute_adversarial_entrapment_penalty(
+        board: &Board,
+        our_idx: usize,
+        _our_current_space: usize,
+        active_snakes: &[usize],
+        config: &Config,
+    ) -> i32 {
+        if our_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let our_snake = &board.snakes[our_idx];
+        if our_snake.health <= 0 || our_snake.body.is_empty() {
+            return 0;
+        }
+
+        let our_head = our_snake.body[0];
+        let locality_threshold = config.scores.adversarial_entrapment_distance;
+        let mut max_penalty = 0;
+
+        // Use IDAPOS-filtered active_snakes list - only these snakes are relevant
+        // This avoids redundant locality checks since active_snakes is already filtered
+        for &opp_idx in active_snakes {
+            if opp_idx == our_idx {
+                continue;
+            }
+
+            let opponent = &board.snakes[opp_idx];
+            if opponent.health <= 0 || opponent.body.is_empty() {
+                continue;
+            }
+
+            // Check if opponent is within entrapment distance
+            let distance = Self::manhattan_distance(our_head, opponent.body[0]);
+            if distance > locality_threshold {
+                continue; // Snake too far away to pose entrapment threat
+            }
+
+            // Opponent is nearby and active - check if they're cutting off our space
+            // If opponent is longer or equal, they're more dangerous
+            if opponent.length >= our_snake.length {
+                // Estimate: if opponent moves toward us, how much space do we lose?
+                // Simple heuristic: opponents closer to us reduce our effective space
+                let space_threat_ratio = (locality_threshold - distance) as f32 /
+                    locality_threshold as f32;
+
+                if space_threat_ratio > config.scores.adversarial_space_reduction_threshold {
+                    let penalty = (config.scores.adversarial_space_reduction_penalty as f32 *
+                        space_threat_ratio) as i32;
+                    max_penalty = max_penalty.min(-penalty); // Accumulate worst case
+                }
+            }
+        }
+
+        max_penalty
     }
 
     /// Computes territory control score - percentage of free cells controlled
@@ -1518,17 +1805,11 @@ impl Bot {
             let survival = 0; // Alive = 0 penalty
             let health = Self::compute_health_score(board, idx, config);
 
-            // Use cached flood fill result if available (P2: caching optimization)
+            // Compute space score with entrapment detection
+            // Uses IDAPOS-filtered active snakes for adversarial entrapment detection
             let space = if is_active {
-                space_cache.get(&idx).copied().map_or(0, |reachable| {
-                    let snake = &board.snakes[idx];
-                    let required = snake.length as usize + config.scores.space_safety_margin;
-                    if reachable < required {
-                        -((required as i32 - reachable as i32) * config.scores.space_shortage_penalty)
-                    } else {
-                        reachable as i32
-                    }
-                })
+                let active_list = active_snakes.unwrap_or(&[]);
+                Self::compute_space_score(board, idx, active_list, config)
             } else {
                 0
             };
@@ -2103,6 +2384,106 @@ impl Bot {
         let (_, final_score) = shared.get_best();
         info!("Parallel 1v1 search complete: best score = {}", final_score);
     }
+
+    /// Public evaluation for analysis tools - provides detailed score breakdown
+    pub fn evaluate_move_detailed(
+        board: &Board,
+        our_snake_id: &str,
+        test_move: Direction,
+        config: &Config,
+    ) -> DetailedScore {
+        // Apply the move to get resulting board state
+        let mut test_board = board.clone();
+        let our_idx = test_board.snakes.iter().position(|s| s.id == our_snake_id)
+            .expect("Our snake not found");
+
+        let snake = &test_board.snakes[our_idx];
+        let head = snake.body[0];
+        let new_head = match test_move {
+            Direction::Up => Coord { x: head.x, y: head.y + 1 },
+            Direction::Down => Coord { x: head.x, y: head.y - 1 },
+            Direction::Left => Coord { x: head.x - 1, y: head.y },
+            Direction::Right => Coord { x: head.x + 1, y: head.y },
+        };
+
+        // Apply move
+        test_board.snakes[our_idx].body.insert(0, new_head);
+        if test_board.food.contains(&new_head) {
+            test_board.food.retain(|f| *f != new_head);
+            test_board.snakes[our_idx].health = config.game_rules.health_on_food as i32;
+            test_board.snakes[our_idx].length += 1;
+        } else {
+            test_board.snakes[our_idx].body.pop();
+            test_board.snakes[our_idx].health = test_board.snakes[our_idx].health.saturating_sub(config.game_rules.health_loss_per_turn as i32);
+        }
+
+        // Compute individual score components
+        let health = Self::compute_health_score(&test_board, our_idx, config);
+        let space = Self::compute_space_score(&test_board, our_idx, &[], config);
+        let control = Self::compute_control_score(&test_board, our_idx, config);
+        let length = test_board.snakes[our_idx].length * config.scores.weight_length;
+
+        let space_cache: HashMap<usize, usize> = HashMap::new();
+        let attack = Self::compute_attack_score(&test_board, our_idx, config, &space_cache);
+
+        let head_collision = if !test_board.snakes[our_idx].body.is_empty() {
+            Self::check_head_collision_danger(&test_board, our_idx, test_board.snakes[our_idx].body[0], config)
+        } else {
+            0
+        };
+
+        let (wall_penalty, center_bias) = if !test_board.snakes[our_idx].body.is_empty() {
+            let h = test_board.snakes[our_idx].body[0];
+            (
+                Self::compute_wall_penalty(h, test_board.width as i32, test_board.height as i32, config),
+                Self::compute_center_bias(h, test_board.width as i32, test_board.height as i32, config),
+            )
+        } else {
+            (0, 0)
+        };
+
+        let survival = if test_board.snakes[our_idx].health > 0 { 0 } else { config.scores.score_survival_penalty };
+
+        // Weighted total
+        let total = survival
+            + (config.scores.score_survival_weight * survival as f32) as i32
+            + (config.scores.weight_space * space as f32) as i32
+            + (config.scores.weight_health * health as f32) as i32
+            + (config.scores.weight_control * control as f32) as i32
+            + (config.scores.weight_attack * attack as f32) as i32
+            + length
+            + head_collision
+            + wall_penalty
+            + center_bias;
+
+        DetailedScore {
+            total,
+            survival,
+            health,
+            space,
+            control,
+            attack,
+            length,
+            head_collision,
+            wall_penalty,
+            center_bias,
+        }
+    }
+}
+
+/// Detailed score breakdown for analysis
+#[derive(Debug, Clone)]
+pub struct DetailedScore {
+    pub total: i32,
+    pub survival: i32,
+    pub health: i32,
+    pub space: i32,
+    pub control: i32,
+    pub attack: i32,
+    pub length: i32,
+    pub head_collision: i32,
+    pub wall_penalty: i32,
+    pub center_bias: i32,
 }
 
 #[cfg(test)]

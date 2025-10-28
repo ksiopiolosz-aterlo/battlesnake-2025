@@ -87,6 +87,11 @@ These are tunable parameters (consider externalizing to a config file):
 ## Core Principles
 - **IMPORTANT**: Use OOP-style patterns in Rust for clear object representation and maintainability
 - **MUST NEVER** use `unsafe` code blocks
+- **CRITICAL - CONSTANTS MUST BE IN BOTH FILES**: ALL constants MUST be defined in BOTH `Snake.toml` AND `src/config.rs` with matching values
+  - Add constants to appropriate section in `Snake.toml`
+  - Create corresponding struct field in `src/config.rs`
+  - Add to `Config` struct if new section
+  - Add to `default_hardcoded()` function with matching default values
 - Prefer simple, straightforward representations over complex abstractions
 - Keep functions small and focused (cognitive complexity < 15)
 
@@ -577,6 +582,62 @@ fn pessimistic_tie_break(a: &ScoreTuple, b: &ScoreTuple, our_idx: usize) -> Scor
     if opponent_sum(a) < opponent_sum(b) { a.clone() } else { b.clone() }
 }
 ```
+
+### IDAPOS Filtering Guidelines
+
+**CRITICAL PRINCIPLE**: When iterating over snakes in evaluation functions, always consider whether to use the IDAPOS-filtered `active_snakes` list instead of blindly enumerating all snakes on the board.
+
+**Why This Matters**:
+- Far-away snakes have minimal impact on our immediate decisions
+- Processing all snakes wastes computation time
+- IDAPOS filtering dramatically reduces branching factor in multiplayer games
+- Consistency: If search uses filtered snakes, evaluation should too
+
+**When to Use IDAPOS Filtering**:
+
+✅ **USE active_snakes for**:
+- **Space control evaluation** - Only nearby snakes can realistically trap us
+- **Adversarial entrapment detection** - Far snakes can't actively reduce our space
+- **Attack scoring** - Only nearby opponents are relevant for immediate threats
+- **Head-to-head collision avoidance** - Distance-based relevance
+- **Any distance-based computation** - If you're checking manhattan_distance, you probably want IDAPOS
+
+❌ **DON'T filter for**:
+- **Territory control** (Voronoi) - All snakes compete for board space globally
+- **Survival checks** - Must know if ANY snake is our snake
+- **Global board state** - Food placement, board dimensions, turn count
+
+**Implementation Pattern**:
+
+```rust
+// ✅ GOOD: Uses pre-computed active_snakes list
+fn compute_space_score(
+    board: &Board,
+    snake_idx: usize,
+    active_snakes: &[usize],  // ← Pass filtered list
+    config: &Config,
+) -> i32 {
+    // Adversarial entrapment: only consider active snakes
+    for &opp_idx in active_snakes {
+        if opp_idx == snake_idx { continue; }
+        // Check entrapment by this nearby opponent
+    }
+}
+
+// ❌ BAD: Iterates all snakes without considering locality
+fn compute_space_score(
+    board: &Board,
+    snake_idx: usize,
+    config: &Config,
+) -> i32 {
+    // Checks ALL snakes even if far away
+    for (opp_idx, opponent) in board.snakes.iter().enumerate() {
+        // This opponent might be 50+ cells away and irrelevant!
+    }
+}
+```
+
+**Key Insight**: IDAPOS filtering is computed once per depth level in search. Reuse this list throughout evaluation by passing it as a parameter - don't recompute locality checks.
 
 **Step 5: Sequential Search (Graceful Uniprocessor Degradation)**
 ```rust
