@@ -27,7 +27,89 @@ Analyzed 47 Rusty vs Rusty self-play games to identify algorithmic weaknesses an
   - Body collisions (running into opponent or self)
   - Starvation (health reaches 0)
 
-**Status**: ✅ Wall collision prevention working correctly
+**Status**: ❌ REAL BUG FOUND - See detailed analysis below
+
+### Validation Results (Updated)
+
+**Initial validation** (flawed - checked all snakes with one move):
+- 3,311 illegal moves detected
+- Validation tool was incorrectly applying chosen_move to ALL snakes
+
+**Corrected validation** (checks only snake at index 0):
+- **1,708 confirmed illegal moves** across 47 games
+- Mix of wall collisions and neck collisions
+- These are REAL bugs in move selection logic
+
+### Root Cause Analysis
+
+**Bug Location**: `src/bot.rs` lines 450-457, 1572-1579 (and similar in other search functions)
+
+**The Problem**: When `generate_legal_moves()` returns an empty vector (no legal moves available), the code defaults to "up" direction **without checking if "up" is actually legal**.
+
+```rust
+if legal_moves.is_empty() {
+    info!("No legal moves available");
+    shared.best_move.store(
+        config.direction_encoding.direction_up_index,  // ← Bug: "up" might be illegal!
+        Ordering::Release,
+    );
+    shared.best_score.store(i32::MIN, Ordering::Release);
+    return;
+}
+```
+
+**Why This Happens**:
+- Snake gets trapped (no legal moves due to walls/bodies)
+- Code defaults to "up" as a fallback
+- If snake is at top wall (y=10) or "up" goes into neck, the move is illegal
+- Game server receives illegal move
+- This shows up in logs as illegal wall collision or neck collision
+
+**Evidence**:
+- Game 04, Turn 2: Snake at (8,0) chose "down" → (8,-1) [out of bounds]
+  - Snake was at bottom wall, had legal moves "up" and "left" available
+  - This suggests the bug might be more complex than just the no-moves fallback
+- Game 47: 93 illegal moves (most of any game)
+  - Many wall collisions at x=10 or x=11 (right wall)
+  - Many neck collisions
+
+**Status**: ✅ Wall collision **DETECTION** working correctly in validation
+**Status**: ❌ Wall collision **PREVENTION** has bugs in move selection
+
+### Fix Applied
+
+**Change**: Modified all three search functions (`sequential_search`, `parallel_multiplayer_search`, `parallel_1v1_search`) to use intelligent fallback when no legal moves exist.
+
+**Before**:
+```rust
+if legal_moves.is_empty() {
+    shared.best_move.store(direction_up_index, Ordering::Release);
+    // Always defaults to "up", even if "up" is illegal!
+}
+```
+
+**After**:
+```rust
+if legal_moves.is_empty() {
+    // Try to find ANY in-bounds move, even if it hits body/neck
+    let fallback_move = Direction::all()
+        .iter()
+        .find(|&&dir| {
+            let next = dir.apply(&you.body[0]);
+            !Self::is_out_of_bounds(&next, board.width, board.height)
+        })
+        .copied()
+        .unwrap_or(Direction::Up); // Only default to Up if ALL moves are out-of-bounds
+
+    shared.best_move.store(Self::direction_to_index(fallback_move, config), Ordering::Release);
+}
+```
+
+**Rationale**: When the snake is truly trapped (no legal moves), it's going to die anyway. But we should at least try to pick a move that stays in-bounds rather than defaulting to an arbitrary direction that might be out-of-bounds.
+
+**Expected Impact**: Should reduce wall collision illegal moves in trapped scenarios. However, this fix only addresses the "no legal moves" case. The mystery remains: why do illegal moves occur when legal moves ARE available (e.g., Game 04 Turn 2)?
+
+**Testing**: Fix needs validation with behavioral tests and re-running validation tool on self-play games.
 
 ### 2. Match Rate Statistics
 
@@ -186,6 +268,34 @@ Add tests for:
 - Food vs survival trade-offs
 - Aggressive vs defensive play
 
+### Phase 4: Sanity Checking Code Checks
+Looking through the code carefully, see if the following potentially identified flaws hold any water:
+
+1. **Food Consumption Race Condition**
+In `apply_move`, food is removed immediately when a snake eats it:
+```rust
+if ate_food {
+    board.food.retain(|&f| f != new_head);
+    //...
+}
+```
+But in the search tree, when evaluating moves sequentially for different snakes, the first snake evaluated "gets" the food. In reality, if multiple snakes reach food simultaneously, they all eat it. This could lead to incorrect evaluation of contested food situations.
+
+2. **Head Collision Detection Incomplete**
+The `is_dangerous_head_to_head` function doesn't account for snakes that might grow before collision. If both snakes eat food on their way to a collision point, the length comparison could change. This is especially important near food clusters.
+
+3. **Advance Game State Order of Operations**
+The `advance_game_state` function handles collisions AFTER all moves are applied, but it checks for body collisions using the NEW positions. This means a snake could appear to collide with a body segment that actually just moved away. The body collision check should use the positions from BEFORE the moves.
+4. **MaxN Dead Snake Handling**
+When a snake has no legal moves in `maxn_search`, it's marked dead but the search continues to the next player at the same depth. However, this death might create cascading effects (like freeing up space) that aren't properly propagated until the next full round.
+
+5. **Missing Bounds Check in Direction::apply**
+While the code checks bounds after applying moves, the `Direction::apply` method itself could produce coordinates that overflow/underflow i32. Not shown in this file, but if `Coord` uses i32, moves near i32::MAX or i32::MIN could cause issues.
+
+6. **Evaluation Asymmetry**
+The evaluation function computes scores for all snakes but only applies the survival penalty to our snake when dead. Opponent snakes get `score_dead_snake` but not `score_survival_penalty`. This asymmetry could lead to suboptimal decisions in endgame scenarios.
+
+
 ## Next Steps
 
 1. **Investigate Game 01, Turn 42-43** - Confirm wall collision
@@ -211,6 +321,7 @@ for i in {01..47}; do
 done
 ```
 
+
 ## References
 
 - Game files: `tests/fixtures/1v1_self/game_*.jsonl`
@@ -218,3 +329,4 @@ done
 - Bot logic: `src/bot.rs`
 - Config: `Snake.toml` and `src/config.rs`
 - Algorithm spec: `CLAUDE.md`
+

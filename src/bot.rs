@@ -14,7 +14,7 @@ use log::info;
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -153,10 +153,9 @@ impl AdaptiveTimeEstimator {
 /// Lock-free shared state for communication between async poller and computation engine
 #[derive(Debug)]
 pub struct SharedSearchState {
-    /// Best move found so far (encoded as direction index)
-    pub best_move: Arc<AtomicU8>,
-    /// Best score for our snake
-    pub best_score: Arc<AtomicI32>,
+    /// Packed best move and score (u64: high 32 bits = score as i32, low 8 bits = move, rest unused)
+    /// This ensures atomic updates of both values together, preventing race conditions
+    pub best_move_and_score: Arc<AtomicU64>,
     /// Flag indicating search completion
     pub search_complete: Arc<AtomicBool>,
     /// Current search depth being explored
@@ -166,13 +165,66 @@ pub struct SharedSearchState {
 impl SharedSearchState {
     /// Creates a new shared state with default initial values
     pub fn new() -> Self {
+        // Pack initial values: move=0 (Up), score=i32::MIN
+        let packed = Self::pack_move_score(0, i32::MIN);
         SharedSearchState {
-            best_move: Arc::new(AtomicU8::new(0)), // Default to Up
-            best_score: Arc::new(AtomicI32::new(i32::MIN)),
+            best_move_and_score: Arc::new(AtomicU64::new(packed)),
             search_complete: Arc::new(AtomicBool::new(false)),
             current_depth: Arc::new(AtomicU8::new(0)),
         }
     }
+
+    /// Packs move (u8) and score (i32) into a u64
+    /// Format: [score: i32 as u32 (bits 32-63)][unused: u24 (bits 8-31)][move: u8 (bits 0-7)]
+    #[inline]
+    fn pack_move_score(move_idx: u8, score: i32) -> u64 {
+        let score_bits = (score as i32) as u32 as u64;
+        let move_bits = move_idx as u64;
+        (score_bits << 32) | move_bits
+    }
+
+    /// Unpacks u64 into (move_idx, score)
+    #[inline]
+    fn unpack_move_score(packed: u64) -> (u8, i32) {
+        let move_idx = (packed & 0xFF) as u8;
+        let score = ((packed >> 32) as u32) as i32;
+        (move_idx, score)
+    }
+
+    /// Atomically updates best move and score if the new score is better
+    /// Returns true if update succeeded, false if another thread had a better score
+    pub fn try_update_best(&self, move_idx: u8, score: i32) -> bool {
+        let new_packed = Self::pack_move_score(move_idx, score);
+
+        loop {
+            let current_packed = self.best_move_and_score.load(Ordering::Acquire);
+            let (_current_move, current_score) = Self::unpack_move_score(current_packed);
+
+            // Only update if new score is strictly better
+            if score <= current_score {
+                return false;
+            }
+
+            // Try to atomically swap
+            match self.best_move_and_score.compare_exchange(
+                current_packed,
+                new_packed,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue, // Another thread updated, retry
+            }
+        }
+    }
+
+    /// Gets the current best move and score atomically
+    /// Returns (move_idx, score) as a tuple
+    pub fn get_best(&self) -> (u8, i32) {
+        let packed = self.best_move_and_score.load(Ordering::Acquire);
+        Self::unpack_move_score(packed)
+    }
+
 }
 
 /// Battlesnake Bot with OOP-style API
@@ -295,9 +347,8 @@ impl Bot {
         }
 
         // Extract results from shared state
-        let chosen_move =
-            Self::index_to_direction(shared.best_move.load(Ordering::Acquire), &self.config);
-        let final_score = shared.best_score.load(Ordering::Acquire);
+        let (best_move_idx, final_score) = shared.get_best();
+        let chosen_move = Self::index_to_direction(best_move_idx, &self.config);
         let final_depth = shared.current_depth.load(Ordering::Acquire);
 
         info!(
@@ -409,10 +460,11 @@ impl Bot {
         }
 
         shared.search_complete.store(true, Ordering::Release);
+        let (best_move_idx, best_score) = shared.get_best();
         info!(
             "Search complete. Best move: {:?}, Score: {}",
-            Self::index_to_direction(shared.best_move.load(Ordering::Acquire), config).as_str(),
-            shared.best_score.load(Ordering::Acquire)
+            Self::index_to_direction(best_move_idx, config).as_str(),
+            best_score
         );
     }
 
@@ -448,12 +500,22 @@ impl Bot {
         let legal_moves = Self::generate_legal_moves(board, you, config);
 
         if legal_moves.is_empty() {
-            info!("No legal moves available");
-            shared.best_move.store(
-                config.direction_encoding.direction_up_index,
-                Ordering::Release,
+            info!("No legal moves available - choosing least-bad fallback");
+            // When trapped, try to pick a move that's at least in-bounds
+            // Priority: any in-bounds move > out-of-bounds move
+            let fallback_move = Direction::all()
+                .iter()
+                .find(|&&dir| {
+                    let next = dir.apply(&you.body[0]);
+                    !Self::is_out_of_bounds(&next, board.width, board.height)
+                })
+                .copied()
+                .unwrap_or(Direction::Up); // If all moves are out of bounds, default to Up
+
+            shared.try_update_best(
+                Self::direction_to_index(fallback_move, config),
+                i32::MIN,
             );
-            shared.best_score.store(i32::MIN, Ordering::Release);
             return;
         }
 
@@ -503,10 +565,7 @@ impl Bot {
                 best_score = score;
 
                 // Immediate update (anytime property)
-                shared
-                    .best_move
-                    .store(Self::direction_to_index(mv, config), Ordering::Release);
-                shared.best_score.store(best_score, Ordering::Release);
+                shared.try_update_best(Self::direction_to_index(mv, config), best_score);
             }
         }
 
@@ -1496,12 +1555,22 @@ impl Bot {
         let legal_moves = Self::generate_legal_moves(board, you, config);
 
         if legal_moves.is_empty() {
-            info!("No legal moves available");
-            shared.best_move.store(
-                config.direction_encoding.direction_up_index,
-                Ordering::Release,
+            info!("No legal moves available - choosing least-bad fallback");
+            // When trapped, try to pick a move that's at least in-bounds
+            // Priority: any in-bounds move > out-of-bounds move
+            let fallback_move = Direction::all()
+                .iter()
+                .find(|&&dir| {
+                    let next = dir.apply(&you.body[0]);
+                    !Self::is_out_of_bounds(&next, board.width, board.height)
+                })
+                .copied()
+                .unwrap_or(Direction::Up); // If all moves are out of bounds, default to Up
+
+            shared.try_update_best(
+                Self::direction_to_index(fallback_move, config),
+                i32::MIN,
             );
-            shared.best_score.store(i32::MIN, Ordering::Release);
             return;
         }
 
@@ -1531,27 +1600,11 @@ impl Bot {
             );
             let our_score = tuple.for_player(our_idx);
 
-            // Lock-free atomic update using compare-and-swap
-            loop {
-                let current_best = shared.best_score.load(Ordering::Acquire);
-                if our_score <= current_best {
-                    break;
-                }
-
-                if shared
-                    .best_score
-                    .compare_exchange(current_best, our_score, Ordering::Release, Ordering::Acquire)
-                    .is_ok()
-                {
-                    shared
-                        .best_move
-                        .store(Self::direction_to_index(mv, config), Ordering::Release);
-                    break;
-                }
-            }
+            // Atomic update of best move and score together (prevents race conditions)
+            shared.try_update_best(Self::direction_to_index(mv, config), our_score);
         });
 
-        let final_score = shared.best_score.load(Ordering::Acquire);
+        let (_, final_score) = shared.get_best();
         info!(
             "Parallel multiplayer search complete: best score = {}",
             final_score
@@ -1570,12 +1623,22 @@ impl Bot {
         let legal_moves = Self::generate_legal_moves(board, you, config);
 
         if legal_moves.is_empty() {
-            info!("No legal moves available");
-            shared.best_move.store(
-                config.direction_encoding.direction_up_index,
-                Ordering::Release,
+            info!("No legal moves available - choosing least-bad fallback");
+            // When trapped, try to pick a move that's at least in-bounds
+            // Priority: any in-bounds move > out-of-bounds move
+            let fallback_move = Direction::all()
+                .iter()
+                .find(|&&dir| {
+                    let next = dir.apply(&you.body[0]);
+                    !Self::is_out_of_bounds(&next, board.width, board.height)
+                })
+                .copied()
+                .unwrap_or(Direction::Up); // If all moves are out of bounds, default to Up
+
+            shared.try_update_best(
+                Self::direction_to_index(fallback_move, config),
+                i32::MIN,
             );
-            shared.best_score.store(i32::MIN, Ordering::Release);
             return;
         }
 
@@ -1606,27 +1669,153 @@ impl Bot {
                 config,
             );
 
-            // Lock-free atomic update using compare-and-swap
-            loop {
-                let current_best = shared.best_score.load(Ordering::Acquire);
-                if score <= current_best {
-                    break;
-                }
-
-                if shared
-                    .best_score
-                    .compare_exchange(current_best, score, Ordering::Release, Ordering::Acquire)
-                    .is_ok()
-                {
-                    shared
-                        .best_move
-                        .store(Self::direction_to_index(mv, config), Ordering::Release);
-                    break;
-                }
-            }
+            // Atomic update of best move and score together (prevents race conditions)
+            shared.try_update_best(Self::direction_to_index(mv, config), score);
         });
 
-        let final_score = shared.best_score.load(Ordering::Acquire);
+        let (_, final_score) = shared.get_best();
         info!("Parallel 1v1 search complete: best score = {}", final_score);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_unpack_positive_score() {
+        let move_idx = 2u8; // Left
+        let score = 12345i32;
+        
+        let packed = SharedSearchState::pack_move_score(move_idx, score);
+        let (unpacked_move, unpacked_score) = SharedSearchState::unpack_move_score(packed);
+        
+        assert_eq!(unpacked_move, move_idx, "Move should be preserved");
+        assert_eq!(unpacked_score, score, "Score should be preserved");
+    }
+
+    #[test]
+    fn test_pack_unpack_negative_score() {
+        let move_idx = 3u8; // Right
+        let score = -54321i32;
+        
+        let packed = SharedSearchState::pack_move_score(move_idx, score);
+        let (unpacked_move, unpacked_score) = SharedSearchState::unpack_move_score(packed);
+        
+        assert_eq!(unpacked_move, move_idx, "Move should be preserved");
+        assert_eq!(unpacked_score, score, "Negative score should be preserved");
+    }
+
+    #[test]
+    fn test_pack_unpack_min_score() {
+        let move_idx = 0u8; // Up
+        let score = i32::MIN;
+        
+        let packed = SharedSearchState::pack_move_score(move_idx, score);
+        let (unpacked_move, unpacked_score) = SharedSearchState::unpack_move_score(packed);
+        
+        assert_eq!(unpacked_move, move_idx, "Move should be preserved");
+        assert_eq!(unpacked_score, score, "i32::MIN should be preserved");
+    }
+
+    #[test]
+    fn test_pack_unpack_max_score() {
+        let move_idx = 1u8; // Down
+        let score = i32::MAX;
+        
+        let packed = SharedSearchState::pack_move_score(move_idx, score);
+        let (unpacked_move, unpacked_score) = SharedSearchState::unpack_move_score(packed);
+        
+        assert_eq!(unpacked_move, move_idx, "Move should be preserved");
+        assert_eq!(unpacked_score, score, "i32::MAX should be preserved");
+    }
+
+    #[test]
+    fn test_pack_unpack_all_moves() {
+        // Test all possible move values (0-3)
+        for move_idx in 0u8..=3 {
+            let score = (move_idx as i32) * 1000 - 5000;
+            
+            let packed = SharedSearchState::pack_move_score(move_idx, score);
+            let (unpacked_move, unpacked_score) = SharedSearchState::unpack_move_score(packed);
+            
+            assert_eq!(unpacked_move, move_idx, "Move {} should be preserved", move_idx);
+            assert_eq!(unpacked_score, score, "Score for move {} should be preserved", move_idx);
+        }
+    }
+
+    #[test]
+    fn test_try_update_best_improves() {
+        let state = SharedSearchState::new();
+
+        // Initial state: move=0 (Up), score=i32::MIN
+        let (move_idx, score) = state.get_best();
+        assert_eq!(move_idx, 0);
+        assert_eq!(score, i32::MIN);
+
+        // Update with better score should succeed
+        let result = state.try_update_best(2, 1000);
+        assert!(result, "Update with better score should succeed");
+        let (move_idx, score) = state.get_best();
+        assert_eq!(move_idx, 2);
+        assert_eq!(score, 1000);
+    }
+
+    #[test]
+    fn test_try_update_best_rejects_worse() {
+        let state = SharedSearchState::new();
+        state.try_update_best(1, 5000);
+
+        // Update with worse score should fail
+        let result = state.try_update_best(2, 3000);
+        assert!(!result, "Update with worse score should fail");
+        let (move_idx, score) = state.get_best();
+        assert_eq!(move_idx, 1, "Move should not change");
+        assert_eq!(score, 5000, "Score should not change");
+    }
+
+    #[test]
+    fn test_try_update_best_rejects_equal() {
+        let state = SharedSearchState::new();
+        state.try_update_best(1, 5000);
+
+        // Update with equal score should fail
+        let result = state.try_update_best(2, 5000);
+        assert!(!result, "Update with equal score should fail");
+        let (move_idx, score) = state.get_best();
+        assert_eq!(move_idx, 1, "Move should not change");
+        assert_eq!(score, 5000, "Score should not change");
+    }
+
+    #[test]
+    fn test_concurrent_updates_no_mismatch() {
+        use std::sync::Arc;
+        use std::thread;
+        
+        let state = Arc::new(SharedSearchState::new());
+        let mut handles = vec![];
+        
+        // Spawn 10 threads, each trying to update with different scores
+        for i in 0..10 {
+            let state_clone = Arc::clone(&state);
+            let handle = thread::spawn(move || {
+                let move_idx = (i % 4) as u8;
+                let score = i * 1000;
+                state_clone.try_update_best(move_idx, score);
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        
+        // Verify final state is consistent (move and score match)
+        let (final_move, final_score) = state.get_best();
+
+        // The score should be 9000 (highest), and move should match
+        assert_eq!(final_score, 9000, "Best score should be from highest update");
+        assert_eq!(final_move, 1, "Best move should match the highest score (9 % 4 = 1)");
     }
 }

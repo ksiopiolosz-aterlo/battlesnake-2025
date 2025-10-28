@@ -263,4 +263,153 @@ mod tests {
         assert_eq!(config.timing.initial_depth, 2);
         assert_eq!(config.scores.weight_space, 10.0);
     }
+
+    #[test]
+    fn test_snake_toml_can_be_parsed() {
+        // This test ensures Snake.toml is valid and can be parsed
+        let result = Config::from_file("Snake.toml");
+        assert!(
+            result.is_ok(),
+            "Failed to parse Snake.toml: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_snake_toml_contains_all_required_fields() {
+        let config = Config::from_file("Snake.toml")
+            .expect("Snake.toml should be parseable");
+
+        // Test timing config
+        assert!(config.timing.response_time_budget_ms > 0);
+        assert!(config.timing.network_overhead_ms > 0);
+        assert!(config.timing.polling_interval_ms > 0);
+        assert!(config.timing.initial_depth > 0);
+        assert!(config.timing.min_time_remaining_ms > 0);
+        assert!(config.timing.max_search_depth > 0);
+
+        // Test time estimation config
+        assert!(config.time_estimation.base_iteration_time_ms > 0.0);
+        assert!(config.time_estimation.branching_factor > 0.0);
+        assert!(config.time_estimation.model_weight >= 0.0);
+        assert!(config.time_estimation.model_weight <= 1.0);
+
+        // Test strategy config
+        assert!(config.strategy.min_snakes_for_1v1 > 0);
+        assert!(config.strategy.min_cpus_for_parallel > 0);
+
+        // Test scores config (including health_threat_distance)
+        assert!(config.scores.health_threat_distance > 0);
+        assert!(config.scores.score_dead_snake < 0);
+        assert!(config.scores.score_survival_penalty < 0);
+        assert!(config.scores.score_survival_weight > 0.0);
+        assert!(config.scores.weight_space > 0.0);
+        assert!(config.scores.weight_health > 0.0);
+        assert!(config.scores.weight_control > 0.0);
+        assert!(config.scores.weight_attack > 0.0);
+        assert!(config.scores.weight_length > 0);
+
+        // Test debug config
+        assert!(!config.debug.log_file_path.is_empty());
+    }
+
+    #[test]
+    fn test_health_threat_distance_matches_hardcoded_default() {
+        let file_config = Config::from_file("Snake.toml")
+            .expect("Snake.toml should be parseable");
+        let hardcoded_config = Config::default_hardcoded();
+
+        assert_eq!(
+            file_config.scores.health_threat_distance,
+            hardcoded_config.scores.health_threat_distance,
+            "health_threat_distance in Snake.toml should match hardcoded default"
+        );
+    }
+
+    #[test]
+    fn test_all_config_values_match_hardcoded_defaults() {
+        let file_config = Config::from_file("Snake.toml")
+            .expect("Snake.toml should be parseable");
+        let hardcoded_config = Config::default_hardcoded();
+
+        // Timing
+        assert_eq!(
+            file_config.timing.response_time_budget_ms,
+            hardcoded_config.timing.response_time_budget_ms
+        );
+        assert_eq!(
+            file_config.timing.network_overhead_ms,
+            hardcoded_config.timing.network_overhead_ms
+        );
+        assert_eq!(
+            file_config.timing.initial_depth,
+            hardcoded_config.timing.initial_depth
+        );
+
+        // Scores
+        assert_eq!(
+            file_config.scores.weight_space,
+            hardcoded_config.scores.weight_space
+        );
+        assert_eq!(
+            file_config.scores.weight_health,
+            hardcoded_config.scores.weight_health
+        );
+        assert_eq!(
+            file_config.scores.health_threat_distance,
+            hardcoded_config.scores.health_threat_distance
+        );
+        assert_eq!(
+            file_config.scores.head_collision_penalty,
+            hardcoded_config.scores.head_collision_penalty
+        );
+
+        // Strategy
+        assert_eq!(
+            file_config.strategy.min_snakes_for_1v1,
+            hardcoded_config.strategy.min_snakes_for_1v1
+        );
+        assert_eq!(
+            file_config.strategy.min_cpus_for_parallel,
+            hardcoded_config.strategy.min_cpus_for_parallel
+        );
+
+        // IDAPOS
+        assert_eq!(
+            file_config.idapos.head_distance_multiplier,
+            hardcoded_config.idapos.head_distance_multiplier
+        );
+        assert_eq!(
+            file_config.idapos.min_snakes_for_alpha_beta,
+            hardcoded_config.idapos.min_snakes_for_alpha_beta
+        );
+
+        // Game Rules
+        assert_eq!(
+            file_config.game_rules.health_on_food,
+            hardcoded_config.game_rules.health_on_food
+        );
+        assert_eq!(
+            file_config.game_rules.health_loss_per_turn,
+            hardcoded_config.game_rules.health_loss_per_turn
+        );
+        assert_eq!(
+            file_config.game_rules.terminal_state_threshold,
+            hardcoded_config.game_rules.terminal_state_threshold
+        );
+    }
+
+    #[test]
+    fn test_load_or_default_works() {
+        // This should succeed with the actual file
+        let config = Config::load_or_default();
+        assert_eq!(config.scores.health_threat_distance, 3);
+    }
+
+    #[test]
+    fn test_invalid_toml_returns_error() {
+        // Test with a non-existent file
+        let result = Config::from_file("nonexistent.toml");
+        assert!(result.is_err());
+    }
 }

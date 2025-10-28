@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::bot::Bot;
 use crate::config::Config;
-use crate::types::{Battlesnake, Board, Direction};
+use crate::types::{Board, Direction};
 
 /// Represents a single log entry from the debug JSONL file
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -143,8 +143,7 @@ impl ReplayEngine {
         }
 
         let computation_time = start_time.elapsed().as_millis();
-        let move_idx = shared.best_move.load(Ordering::Acquire);
-        let score = shared.best_score.load(Ordering::Acquire);
+        let (move_idx, score) = shared.get_best();
         let depth = shared.current_depth.load(Ordering::Acquire);
 
         let direction = Bot::index_to_direction(move_idx, &self.config);
