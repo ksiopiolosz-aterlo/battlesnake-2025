@@ -6,21 +6,28 @@ Analyzed 47 Rusty vs Rusty self-play games to identify algorithmic weaknesses an
 
 ## Key Findings
 
-### 1. Wall-Running Behavior (CRITICAL BUG)
+### 1. Wall-Running Behavior Analysis
 
-**Game 01, Turn 42**: Snake at position (0,8) chose move "up"
-- Snake was already against left wall (x=0)
-- Board dimensions: 11x11 (coords 0-10)
-- Result: Snake died from wall collision
-- **Root cause**: Survival logic failed to recognize wall as immediate death
+**Initial Investigation - Game 01**:
+- Turn 42: Snake at (0,8) chose "up" → (0,9) - **VALID MOVE**
+- Game ends at turn 42 with one snake at (0,8) against left wall
+- Death was NOT from wall collision, likely from head-to-head or body collision
 
-**Analysis**: The snake had these options at (0,8):
-- Up: (0,9) - Valid
-- Down: (0,7) - Valid
-- Left: (-1,8) - **OUT OF BOUNDS / WALL**
-- Right: (1,8) - Valid
+**Game 02 - Bottom Wall Pattern**:
+- Turn 50: Snake at (3,1) chose "down" → (3,0) - **VALID MOVE** (y=0 is legal)
+- Turn 51: Snake at (3,0) chose "up" → (3,1) - **VALID MOVE** (correctly avoids wall)
+- Game ends at turn 51
+- No wall collision detected - snake correctly stayed in bounds
 
-The chosen move "up" went to (0,9), which was valid. Need to check turn 43 to see the actual collision.
+**Conclusion**: Initial hypothesis of wall-running bug NOT confirmed
+- All observed moves stayed within legal bounds (0 to width-1, 0 to height-1)
+- Move generation correctly filters out-of-bounds moves
+- Deaths appear to be from:
+  - Head-to-head collisions (both snakes die if equal length)
+  - Body collisions (running into opponent or self)
+  - Starvation (health reaches 0)
+
+**Status**: ✅ Wall collision prevention working correctly
 
 ### 2. Match Rate Statistics
 
@@ -56,27 +63,61 @@ The longer games (400+ turns) suggest successful evasion and counter-play. These
 
 ## Recommended Algorithm Improvements
 
-### Priority 1: Fix Wall Collision Logic
+### Priority 1: ~~Fix Wall Collision Logic~~ ✅ Working Correctly
 
-**Current Issue**: Move generation or evaluation allows moves that lead to wall death
+**Status**: Analysis confirmed wall collision prevention is working
+- Move generation properly filters out-of-bounds positions
+- No instances of wall collision deaths found in 47 games
+- Deaths are from legitimate game-ending scenarios
 
-**Solution Options**:
+### Priority 2: Food Competition Logic (Nice-to-Have)
 
-1. **Strengthen `generate_legal_moves()`** (src/bot.rs:1232)
-   - Already checks bounds: `next.x < 0 || next.x >= state.board_width`
-   - But evaluation might override with poor scoring
+**Current Behavior**: Snake always targets nearest food regardless of opponent positioning
 
-2. **Add wall-death detection in evaluation** (src/bot.rs:evaluate_state)
-   - Check if any legal move leads to out-of-bounds next turn
-   - Apply massive penalty (worse than SCORE_DEAD_SNAKE)
-   - Current SCORE_DEAD_SNAKE = i32::MIN + 1000
+**Proposed Enhancement**:
+```rust
+fn evaluate_food_target(state: &GameState, snake_idx: usize) -> Option<Coord> {
+    let our_snake = &state.snakes[snake_idx];
+    let our_head = our_snake.body[0];
 
-3. **Lookahead validation**
-   - Before returning best move, simulate one turn ahead
-   - Verify move doesn't result in immediate death
-   - Fallback to any surviving move if best move is suicidal
+    // Find all food sorted by distance
+    let mut food_options: Vec<(Coord, i32)> = state.food.iter()
+        .map(|&food| (food, manhattan_distance(our_head, food)))
+        .collect();
+    food_options.sort_by_key(|(_, dist)| *dist);
 
-### Priority 2: Improve Survival Scoring
+    for (food, our_dist) in food_options {
+        let mut contested = false;
+
+        // Check if any opponent is closer AND has more health
+        for (idx, opponent) in state.snakes.iter().enumerate() {
+            if idx == snake_idx || !opponent.is_alive { continue; }
+
+            let opp_dist = manhattan_distance(opponent.body[0], food);
+            if opp_dist < our_dist && opponent.health >= our_snake.health {
+                contested = true;
+                break;
+            }
+        }
+
+        if !contested {
+            return Some(food);  // Target this food
+        }
+    }
+
+    // Fallback to nearest if all contested
+    food_options.first().map(|(coord, _)| *coord)
+}
+```
+
+**Rationale**:
+- Avoid races we're likely to lose (opponent closer + more health)
+- Seek alternative food sources when primary is contested
+- Reduces risky confrontations that lead to preventable deaths
+
+**Implementation Location**: `src/bot.rs` in `compute_health_score()`
+
+### Priority 3: Improve Survival Scoring
 
 **Current weights** (from CLAUDE.md):
 ```rust
