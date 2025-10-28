@@ -76,6 +76,7 @@ pub struct ScoresConfig {
     pub default_food_distance: i32,
     pub health_max: f32,
     pub score_starvation_base: i32,
+    pub health_threat_distance: i32,
 
     // Space control constants
     pub space_safety_margin: usize,
@@ -195,6 +196,7 @@ impl Config {
                 default_food_distance: 999,
                 health_max: 100.0,
                 score_starvation_base: -50_000,
+                health_threat_distance: 3,
                 space_safety_margin: 5,
                 space_shortage_penalty: 100,
                 territory_scale_factor: 100.0,

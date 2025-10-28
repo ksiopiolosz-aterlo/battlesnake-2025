@@ -964,6 +964,7 @@ impl Bot {
 
     /// Computes health and food score for a snake
     /// Returns higher score for closer food when health is low
+    /// Adds extra urgency when in health disadvantage vs opponents
     fn compute_health_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
         if snake_idx >= board.snakes.len() {
             return config.scores.score_zero_health;
@@ -999,7 +1000,38 @@ impl Bot {
             return config.scores.score_starvation_base + distance_penalty;
         }
 
-        distance_penalty
+        // Check if we're in a health disadvantage against nearby opponents
+        // This helps break out of "death dance" scenarios where both snakes circle endlessly
+        // Only consider opponents that are close enough to be an immediate threat
+        let max_nearby_opponent_health = board
+            .snakes
+            .iter()
+            .enumerate()
+            .filter(|(idx, s)| {
+                if *idx == snake_idx || s.health <= 0 || s.body.is_empty() {
+                    return false;
+                }
+                // Only consider opponents within threat range
+                let dist = Self::manhattan_distance(head, s.body[0]);
+                dist <= config.scores.health_threat_distance
+            })
+            .map(|(_, s)| s.health)
+            .max()
+            .unwrap_or(0);
+
+        // If any nearby opponent has more health than us, add extra food urgency
+        // This multiplier increases the further behind we are in health
+        let health_disadvantage = if max_nearby_opponent_health > snake.health {
+            let health_gap = max_nearby_opponent_health as f32 - snake.health as f32;
+            // Scale the disadvantage: larger gaps = more urgency
+            // Multiply distance penalty by (1 + gap/50), capping at 3x
+            let multiplier = (1.0 + (health_gap / 50.0)).min(3.0);
+            (distance_penalty as f32 * multiplier) as i32
+        } else {
+            distance_penalty
+        };
+
+        health_disadvantage
     }
 
     /// Computes space control score - how many cells are reachable
