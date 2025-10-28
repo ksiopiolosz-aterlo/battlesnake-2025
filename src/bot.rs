@@ -569,6 +569,11 @@ impl Bot {
         let tt = Arc::new(TranspositionTable::new(100_000));
         tt.increment_age();
 
+        // Create killer move table for move ordering
+        // Tracks moves that caused cutoffs for better alpha-beta pruning
+        let mut killers = KillerMoveTable::new(config);
+        let mut pv_move: Option<Direction> = None;
+
         // Determine execution strategy
         let num_alive_snakes = board.snakes.iter().filter(|s| s.health > 0).count();
         let num_cpus = rayon::current_num_threads();
@@ -581,14 +586,6 @@ impl Bot {
 
         // Get appropriate time estimation parameters based on number of alive snakes
         let time_params = config.time_estimation.for_snake_count(num_alive_snakes);
-
-        // Select search function based on strategy (constant for entire game)
-        // This hoists the match outside the iterative deepening loop to save cycles
-        let search_fn: fn(&Board, &Battlesnake, u8, &Arc<SharedSearchState>, &Config, &Arc<TranspositionTable>) = match strategy {
-            ExecutionStrategy::Parallel1v1 => Self::parallel_1v1_search,
-            ExecutionStrategy::ParallelMultiplayer => Self::parallel_multiplayer_search,
-            ExecutionStrategy::Sequential => Self::sequential_search,
-        };
 
         let init_elapsed = init_start.elapsed().as_micros();
         if simple_profiler::is_profiling_enabled() {
@@ -660,14 +657,31 @@ impl Bot {
             );
             shared.current_depth.store(current_depth, Ordering::Release);
 
+            // Clear killers from previous iteration
+            killers.clear();
+
             // Record iteration start time
             let iteration_start = Instant::now();
 
-            // Execute search using pre-selected function pointer
-            search_fn(board, you, current_depth, &shared, config, &tt);
+            // Execute search with strategy-specific parameters
+            match strategy {
+                ExecutionStrategy::Sequential => {
+                    Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, pv_move);
+                }
+                ExecutionStrategy::Parallel1v1 => {
+                    Self::parallel_1v1_search(board, you, current_depth, &shared, config, &tt, pv_move);
+                }
+                ExecutionStrategy::ParallelMultiplayer => {
+                    Self::parallel_multiplayer_search(board, you, current_depth, &shared, config, &tt, pv_move);
+                }
+            }
 
             // Record actual iteration time
             let iteration_elapsed = iteration_start.elapsed().as_millis() as u64;
+
+            // Extract best move from this iteration to use as PV move for next iteration
+            let (best_move_idx, _) = shared.get_best();
+            pv_move = Some(Self::index_to_direction(best_move_idx, config));
 
             info!(
                 "Completed depth {} in {}ms (estimated: {}ms, diff: {}ms)",
@@ -724,9 +738,11 @@ impl Bot {
         shared: &Arc<SharedSearchState>,
         config: &Config,
         tt: &Arc<TranspositionTable>,
+        killers: &mut KillerMoveTable,
+        pv_move: Option<Direction>,
     ) {
         // Generate legal moves for our snake
-        let legal_moves = Self::generate_legal_moves(board, you, config);
+        let mut legal_moves = Self::generate_legal_moves(board, you, config);
 
         if legal_moves.is_empty() {
             info!("No legal moves available - choosing least-bad fallback");
@@ -748,7 +764,11 @@ impl Bot {
             return;
         }
 
-        info!("Evaluating {} legal moves sequentially", legal_moves.len());
+        // Order moves for better alpha-beta pruning
+        // Priority: PV move > killer moves > remaining moves
+        legal_moves = order_moves(legal_moves, pv_move, killers, depth, config);
+
+        info!("Evaluating {} legal moves sequentially (ordered by PV + killers)", legal_moves.len());
 
         // Determine if we should use 1v1 alpha-beta or multiplayer MaxN
         let num_alive = board.snakes.iter().filter(|s| s.health > 0).count();
@@ -778,6 +798,7 @@ impl Bot {
                     false,
                     config,
                     tt,
+                    killers,
                 )
             } else {
                 // Use MaxN for multiplayer
@@ -788,6 +809,7 @@ impl Bot {
                     our_idx,
                     config,
                     tt,
+                    killers,
                 );
                 tuple.for_player(our_idx)
             };
@@ -1965,6 +1987,9 @@ impl Bot {
             }
         }
 
+        // Create local killer table for this search
+        let mut killers = KillerMoveTable::new(config);
+
         // Use alpha-beta to get our score
         let our_score = Self::alpha_beta_minimax(
             &simplified_board,
@@ -1975,6 +2000,7 @@ impl Bot {
             true,
             config,
             tt,
+            &mut killers,
         );
 
         // Create score tuple with our score and opponent's inverse
@@ -1995,6 +2021,7 @@ impl Bot {
         current_player_idx: usize,
         config: &Config,
         tt: &Arc<TranspositionTable>,
+        killers: &mut KillerMoveTable,
     ) -> ScoreTuple {
         let _prof = simple_profiler::ProfileGuard::new("maxn");
 
@@ -2059,23 +2086,26 @@ impl Bot {
                 // Advance game state and reduce depth
                 let mut advanced_board = board.clone();
                 Self::advance_game_state(&mut advanced_board);
-                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, our_idx, config, tt);
+                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, our_idx, config, tt, killers);
             } else {
                 // Continue with next player at same depth
-                return Self::maxn_search(board, our_snake_id, depth, next, config, tt);
+                return Self::maxn_search(board, our_snake_id, depth, next, config, tt, killers);
             }
         }
 
         // Generate legal moves for current player
-        let moves = Self::generate_legal_moves(board, &board.snakes[current_player_idx], config);
+        let mut moves = Self::generate_legal_moves(board, &board.snakes[current_player_idx], config);
 
         if moves.is_empty() {
             // No legal moves - mark snake as dead and continue
             let mut dead_board = board.clone();
             dead_board.snakes[current_player_idx].health = 0;
             let next = (current_player_idx + 1) % board.snakes.len();
-            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config, tt);
+            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config, tt, killers);
         }
+
+        // Order moves (no PV at interior nodes in MaxN, but use killers)
+        moves = order_moves(moves, None, killers, depth, config);
 
         let mut best_tuple =
             ScoreTuple::new_with_value(board.snakes.len(), i32::MIN);
@@ -2090,10 +2120,10 @@ impl Bot {
             let child_tuple = if all_moved {
                 // All snakes have moved - advance game state and reduce depth
                 Self::advance_game_state(&mut child_board);
-                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config, tt)
+                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config, tt, killers)
             } else {
                 // Continue with next player at same depth
-                Self::maxn_search(&child_board, our_snake_id, depth, next, config, tt)
+                Self::maxn_search(&child_board, our_snake_id, depth, next, config, tt, killers)
             };
 
             // Update if current player improves their score
@@ -2125,6 +2155,7 @@ impl Bot {
         is_max: bool,
         config: &Config,
         tt: &Arc<TranspositionTable>,
+        killers: &mut KillerMoveTable,
     ) -> i32 {
         let _prof = simple_profiler::ProfileGuard::new("alpha_beta");
 
@@ -2175,7 +2206,7 @@ impl Bot {
             return scores.for_player(our_idx);
         }
 
-        let moves = Self::generate_legal_moves(board, &board.snakes[player_idx], config);
+        let mut moves = Self::generate_legal_moves(board, &board.snakes[player_idx], config);
 
         if moves.is_empty() {
             let mut dead_board = board.clone();
@@ -2189,8 +2220,12 @@ impl Bot {
                 !is_max,
                 config,
                 tt,
+                killers,
             );
         }
+
+        // Order moves for better alpha-beta pruning (no PV at interior nodes, only killers)
+        moves = order_moves(moves, None, killers, depth, config);
 
         if is_max {
             let mut max_eval = i32::MIN;
@@ -2208,12 +2243,15 @@ impl Bot {
                     false,
                     config,
                     tt,
+                    killers,
                 );
                 max_eval = max_eval.max(eval);
                 alpha = alpha.max(eval);
                 if beta <= alpha {
+                    // Beta cutoff: record this move as a killer
+                    killers.record_killer(depth, mv, config);
                     simple_profiler::record_alpha_beta_cutoff();
-                    break; // Beta cutoff
+                    break;
                 }
             }
             tt.store(board_hash, max_eval, depth);
@@ -2234,12 +2272,15 @@ impl Bot {
                     true,
                     config,
                     tt,
+                    killers,
                 );
                 min_eval = min_eval.min(eval);
                 beta = beta.min(eval);
                 if beta <= alpha {
+                    // Alpha cutoff: record this move as a killer
+                    killers.record_killer(depth, mv, config);
                     simple_profiler::record_alpha_beta_cutoff();
-                    break; // Alpha cutoff
+                    break;
                 }
             }
             tt.store(board_hash, min_eval, depth);
@@ -2256,8 +2297,15 @@ impl Bot {
         shared: &Arc<SharedSearchState>,
         config: &Config,
         tt: &Arc<TranspositionTable>,
+        pv_move: Option<Direction>,
     ) {
-        let legal_moves = Self::generate_legal_moves(board, you, config);
+        // Order moves using PV move from previous iteration
+        let mut legal_moves = Self::generate_legal_moves(board, you, config);
+
+        if !legal_moves.is_empty() {
+            // Order root moves by PV (no killers at root for parallel search)
+            legal_moves = order_moves(legal_moves, pv_move, &KillerMoveTable::new(config), depth, config);
+        }
 
         if legal_moves.is_empty() {
             info!("No legal moves available - choosing least-bad fallback");
@@ -2326,8 +2374,15 @@ impl Bot {
         shared: &Arc<SharedSearchState>,
         config: &Config,
         tt: &Arc<TranspositionTable>,
+        pv_move: Option<Direction>,
     ) {
-        let legal_moves = Self::generate_legal_moves(board, you, config);
+        // Order moves using PV move from previous iteration
+        let mut legal_moves = Self::generate_legal_moves(board, you, config);
+
+        if !legal_moves.is_empty() {
+            // Order root moves by PV (no killers at root for parallel search)
+            legal_moves = order_moves(legal_moves, pv_move, &KillerMoveTable::new(config), depth, config);
+        }
 
         if legal_moves.is_empty() {
             info!("No legal moves available - choosing least-bad fallback");
@@ -2363,6 +2418,9 @@ impl Bot {
 
         // Parallel evaluation of root moves
         legal_moves.par_iter().enumerate().for_each(|(_idx, &mv)| {
+            // Create local killer table for this subtree (each thread gets its own)
+            let mut local_killers = KillerMoveTable::new(config);
+
             let mut child_board = board.clone();
             Self::apply_move(&mut child_board, our_idx, mv, config);
 
@@ -2375,6 +2433,7 @@ impl Bot {
                 false,
                 config,
                 tt,
+                &mut local_killers,
             );
 
             // Atomic update of best move and score together (prevents race conditions)
