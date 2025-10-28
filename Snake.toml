@@ -74,7 +74,9 @@ score_survival_weight = 1000.0
 # Increased from 10.0 to 20.0 to better avoid getting trapped
 weight_space = 20.0
 # Weight for health/food score
-weight_health = 5.0
+# Increased from 5.0 to 20.0 to prioritize food when health is low
+# Matches space weight so bot balances survival (space) with starvation prevention (health)
+weight_health = 20.0
 # Weight for territory control score
 weight_control = 3.0
 # Weight for attack potential score
@@ -115,18 +117,53 @@ attack_trap_margin = 3
 attack_trap_bonus = 100
 
 # Head-to-Head Collision Avoidance
-# Massive penalty for positions where we could collide head-to-head with equal/longer opponent
-head_collision_penalty = -500000
+# Strong penalty for positions where we could collide head-to-head with equal/longer opponent
+# Reduced from -500000 to -50000 to allow space control to influence decisions when all moves have collision risk
+# At -50000: still 25-50x larger than normal score differences but allows meaningful space comparison
+head_collision_penalty = -50000
 
 # Wall Proximity Penalty
 # Formula: penalty = -wall_penalty_base / (distance + 1) if distance < safe_distance_from_wall, else 0
-# Examples: distance=0 → -10000, distance=1 → -5000, distance=2 → -3333, distance≥3 → 0
-wall_penalty_base = 10000            # Base penalty value (divided by distance + 1)
+# Examples (at 1000): distance=0 → -1000, distance=1 → -500, distance=2 → -333, distance≥3 → 0
+# Reduced from 10000 to 1000 to prevent wall avoidance from dominating all other strategic considerations
+wall_penalty_base = 1000             # Base penalty value (divided by distance + 1)
 safe_distance_from_wall = 3          # Distance at which wall penalty becomes 0
 
 # Center Bias
 # Encourages staying near center to maximize escape routes
 center_bias_multiplier = 10          # Distance multiplier for center bias calculation
+
+# Length-Aware Health/Food Constants
+# Base snake length for urgency calculation (snakes shorter than this have urgency 1.0x)
+health_urgency_base_length = 3.0
+# Urgency multiplier per unit of length beyond base (0.1 = 10% increase per length)
+health_urgency_length_multiplier = 0.1
+# Maximum urgency multiplier (caps exponential growth)
+health_urgency_max_multiplier = 2.0
+# Minimum urgency multiplier (floor for very short snakes)
+health_urgency_min_multiplier = 1.0
+# Starvation buffer divisor (buffer = length / divisor, accounts for body navigation)
+starvation_buffer_divisor = 3
+
+# Entrapment Detection Constants
+# Maximum distance to consider as "nearby" for compactness calculation
+entrapment_nearby_threshold = 5
+# Compactness ratio threshold for severe entrapment penalty (<0.3 = narrow corridor)
+entrapment_severe_threshold = 0.3
+# Penalty multiplier for severe entrapment (fraction of reachable space)
+entrapment_severe_penalty_multiplier = 0.5
+# Compactness ratio threshold for moderate entrapment penalty
+entrapment_moderate_threshold = 0.5
+# Penalty multiplier for moderate entrapment (fraction of reachable space)
+entrapment_moderate_penalty_multiplier = 0.2
+
+# Adversarial Entrapment Constants
+# Distance threshold to consider opponent as "nearby threat"
+adversarial_entrapment_distance = 3
+# Penalty when opponent can reduce our space by this percentage
+adversarial_space_reduction_penalty = 10000
+# Minimum space reduction percentage to trigger penalty (0.2 = 20%)
+adversarial_space_reduction_threshold = 0.2
 
 # ============================================================================
 # IDAPOS (Locality Masking) Constants
@@ -189,9 +226,9 @@ terminal_state_threshold = 1
 # ============================================================================
 [debug]
 # Enable debug mode to log game states, moves, and turns to disk
-enabled = false
+enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "battle_royale_all_human.jsonl"
+log_file_path = "balanced.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration

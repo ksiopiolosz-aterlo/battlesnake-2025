@@ -103,6 +103,25 @@ pub struct ScoresConfig {
     pub space_safety_margin: usize,
     pub space_shortage_penalty: i32,
 
+    // Length-aware health/food constants
+    pub health_urgency_base_length: f32,
+    pub health_urgency_length_multiplier: f32,
+    pub health_urgency_max_multiplier: f32,
+    pub health_urgency_min_multiplier: f32,
+    pub starvation_buffer_divisor: i32,
+
+    // Entrapment detection constants
+    pub entrapment_nearby_threshold: i32,
+    pub entrapment_severe_threshold: f32,
+    pub entrapment_severe_penalty_multiplier: f32,
+    pub entrapment_moderate_threshold: f32,
+    pub entrapment_moderate_penalty_multiplier: f32,
+
+    // Adversarial entrapment constants
+    pub adversarial_entrapment_distance: i32,
+    pub adversarial_space_reduction_penalty: i32,
+    pub adversarial_space_reduction_threshold: f32,
+
     // Territory control constants
     pub territory_scale_factor: f32,
 
@@ -231,8 +250,8 @@ impl Config {
                 score_dead_snake: i32::MIN + 1000,
                 score_survival_penalty: -1_000_000,
                 score_survival_weight: 1000.0,
-                weight_space: 10.0,
-                weight_health: 5.0,
+                weight_space: 20.0,
+                weight_health: 20.0,
                 weight_control: 3.0,
                 weight_attack: 2.0,
                 weight_length: 100,
@@ -243,13 +262,29 @@ impl Config {
                 health_threat_distance: 3,
                 space_safety_margin: 5,
                 space_shortage_penalty: 100,
+                // Length-aware health constants
+                health_urgency_base_length: 3.0,
+                health_urgency_length_multiplier: 0.1,
+                health_urgency_max_multiplier: 2.0,
+                health_urgency_min_multiplier: 1.0,
+                starvation_buffer_divisor: 3,
+                // Entrapment detection constants
+                entrapment_nearby_threshold: 5,
+                entrapment_severe_threshold: 0.3,
+                entrapment_severe_penalty_multiplier: 0.5,
+                entrapment_moderate_threshold: 0.5,
+                entrapment_moderate_penalty_multiplier: 0.2,
+                // Adversarial entrapment constants
+                adversarial_entrapment_distance: 3,
+                adversarial_space_reduction_penalty: 10000,
+                adversarial_space_reduction_threshold: 0.2,
                 territory_scale_factor: 100.0,
                 attack_head_to_head_distance: 3,
                 attack_head_to_head_bonus: 50,
                 attack_trap_margin: 3,
                 attack_trap_bonus: 100,
-                head_collision_penalty: -500_000,
-                wall_penalty_base: 10000,
+                head_collision_penalty: -50_000,
+                wall_penalty_base: 1000,
                 safe_distance_from_wall: 3,
                 center_bias_multiplier: 10,
             },
