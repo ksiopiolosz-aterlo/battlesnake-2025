@@ -18,6 +18,7 @@ pub struct Config {
     pub direction_encoding: DirectionEncodingConfig,
     pub game_rules: GameRulesConfig,
     pub debug: DebugConfig,
+    pub profiling: ProfilingConfig,
 }
 
 /// Timing and performance constants
@@ -113,6 +114,13 @@ pub struct ScoresConfig {
 
     // Head-to-head collision avoidance
     pub head_collision_penalty: i32,
+
+    // Wall proximity penalty (mathematical formula)
+    pub wall_penalty_base: i32,
+    pub safe_distance_from_wall: i32,
+
+    // Center bias
+    pub center_bias_multiplier: i32,
 }
 
 /// IDAPOS (Locality Masking) constants
@@ -159,6 +167,17 @@ pub struct GameRulesConfig {
 pub struct DebugConfig {
     pub enabled: bool,
     pub log_file_path: String,
+}
+
+/// Performance profiling configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProfilingConfig {
+    pub enabled: bool,
+    pub log_to_stderr: bool,
+    pub track_move_generation: bool,
+    pub track_evaluation: bool,
+    pub track_search: bool,
+    pub track_transposition_table: bool,
 }
 
 impl Config {
@@ -230,6 +249,9 @@ impl Config {
                 attack_trap_margin: 3,
                 attack_trap_bonus: 100,
                 head_collision_penalty: -500_000,
+                wall_penalty_base: 10000,
+                safe_distance_from_wall: 3,
+                center_bias_multiplier: 10,
             },
             idapos: IdaposConfig {
                 head_distance_multiplier: 2,
@@ -258,6 +280,14 @@ impl Config {
             debug: DebugConfig {
                 enabled: false,
                 log_file_path: "battlesnake_debug.jsonl".to_string(),
+            },
+            profiling: ProfilingConfig {
+                enabled: false,
+                log_to_stderr: true,
+                track_move_generation: true,
+                track_evaluation: true,
+                track_search: true,
+                track_transposition_table: true,
             },
         }
     }

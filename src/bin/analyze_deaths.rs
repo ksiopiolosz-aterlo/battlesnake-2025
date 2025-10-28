@@ -169,33 +169,31 @@ fn analyze_game_death(path: &Path) -> Result<DeathAnalysis, String> {
 }
 
 fn identify_winner_loser(snakes: &[Value]) -> Result<(Value, Value), String> {
-    if snakes.len() != 2 {
-        return Err(format!("Expected 2 snakes, found {}", snakes.len()));
+    if snakes.is_empty() {
+        return Err("No snakes found".to_string());
     }
 
-    let snake1 = &snakes[0];
-    let snake2 = &snakes[1];
+    // Find our snake (Rusty) - this is the one we're analyzing
+    let our_snake = snakes
+        .iter()
+        .find(|s| {
+            s["name"].as_str() == Some("Rusty") ||
+            s["id"].as_str().map(|id| id.contains("Rusty")).unwrap_or(false)
+        })
+        .ok_or("Could not find Rusty snake in game")?;
 
-    let alive1 = snake1["health"].as_i64().unwrap_or(0) > 0;
-    let alive2 = snake2["health"].as_i64().unwrap_or(0) > 0;
+    // Find the winner - the snake with the highest health, or longest if tied
+    let winner = snakes
+        .iter()
+        .filter(|s| s["id"] != our_snake["id"]) // Not us
+        .max_by_key(|s| {
+            let health = s["health"].as_i64().unwrap_or(0);
+            let length = s["length"].as_u64().unwrap_or(0);
+            (health, length)
+        })
+        .unwrap_or(snakes.first().unwrap()); // Fallback to first snake if all are us (shouldn't happen)
 
-    // If one is alive and one is dead, winner is clear
-    if alive1 && !alive2 {
-        return Ok((snake1.clone(), snake2.clone()));
-    }
-    if alive2 && !alive1 {
-        return Ok((snake2.clone(), snake1.clone()));
-    }
-
-    // If both alive or both dead, winner is longer snake
-    let len1 = snake1["length"].as_u64().unwrap_or(0);
-    let len2 = snake2["length"].as_u64().unwrap_or(0);
-
-    if len1 >= len2 {
-        Ok((snake1.clone(), snake2.clone()))
-    } else {
-        Ok((snake2.clone(), snake1.clone()))
-    }
+    Ok((winner.clone(), our_snake.clone()))
 }
 
 fn determine_death_cause(loser: &Value, snakes: &[Value], board: &Value) -> DeathCause {

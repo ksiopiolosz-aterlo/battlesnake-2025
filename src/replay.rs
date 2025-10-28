@@ -113,6 +113,19 @@ impl ReplayEngine {
 
         // Use Bot's internal computation logic
         let shared = Arc::new(crate::bot::SharedSearchState::new());
+
+        // CRITICAL: Initialize shared state with first legal move to ensure we never
+        // return an illegal move if search times out before completing any iterations
+        // This matches the initialization in Bot::get_move()
+        let legal_moves = Bot::generate_legal_moves(board, our_snake, &self.config);
+        if !legal_moves.is_empty() {
+            let first_legal_move = legal_moves[0];
+            shared.try_update_best(
+                Bot::direction_to_index(first_legal_move, &self.config),
+                i32::MIN + 1, // Slightly better than initial i32::MIN to ensure it updates
+            );
+        }
+
         let shared_clone = shared.clone();
         let board_clone = board.clone();
         let our_snake_clone = our_snake.clone();

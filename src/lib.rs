@@ -4,5 +4,7 @@
 pub mod bot;
 pub mod config;
 pub mod debug_logger;
+pub mod profiler;
 pub mod replay;
+pub mod simple_profiler;
 pub mod types;

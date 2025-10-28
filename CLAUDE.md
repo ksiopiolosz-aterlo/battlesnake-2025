@@ -1152,6 +1152,237 @@ Turn 28: left → down (score: -234, depth: 6, time: 301ms)
 Turn 45: right → up (score: 892, depth: 4, time: 189ms)
 ```
 
+## Analysis Tools Inventory
+
+The codebase includes a comprehensive suite of Rust-based analysis tools in `src/bin/`. These tools follow the project's philosophy of using Rust for all analysis work to ensure type safety, performance, and maintainability.
+
+### Core Analysis Tools
+
+#### `replay` - Game State Replay Engine
+**Location**: `src/bin/replay.rs`
+
+Re-runs the bot's algorithm on historical game states to validate decision-making and diagnose issues.
+
+```bash
+# Replay all turns from a log file
+cargo run --release --bin replay -- battlesnake_debug.jsonl --all
+
+# Replay specific turns
+cargo run --release --bin replay -- battlesnake_debug.jsonl --turns 5,10,15,20
+
+# Validate expected moves (regression testing)
+cargo run --release --bin replay -- battlesnake_debug.jsonl --validate 5:up,10:right
+```
+
+**Use cases**:
+- Validate bot behavior on known scenarios
+- Confirm bug fixes for specific problematic turns
+- Regression testing after algorithm changes
+- Understanding why specific moves were chosen
+
+#### `validate_moves` - Move Legality Validator
+**Location**: `src/bin/validate_moves.rs`
+
+Validates that all moves in game logs are legal (stay within bounds, don't collide with neck).
+
+```bash
+cargo run --release --bin validate_moves -- tests/fixtures/1v1_self/
+```
+
+**Use cases**:
+- Detect illegal moves in game logs
+- Verify race condition fixes
+- Quality assurance for recorded games
+- Identify move generation bugs
+
+#### `analyze_fix` - Fix Verification Tool
+**Location**: `src/bin/analyze_fix.rs`
+
+Cross-references validation tool output with replay results to verify bug fixes.
+
+```bash
+cargo run --release --bin analyze_fix -- tests/fixtures/1v1_self/
+```
+
+**Use cases**:
+- Verify that code changes fix identified bugs
+- Measure effectiveness of bug fixes
+- Generate before/after comparison reports
+
+### Game Log Processing Tools
+
+#### `split_games` - Multi-Game Log Splitter
+**Location**: `src/bin/split_games.rs`
+
+Splits multi-game JSONL files into individual game files for easier analysis.
+
+```bash
+cargo run --release --bin split_games -- 1v1_loopy_bot.jsonl
+cargo run --release --bin split_games -- 1v1_self.jsonl
+```
+
+**Output**: Creates `tests/fixtures/<basename>/game_01.jsonl`, `game_02.jsonl`, etc.
+
+**Features**:
+- Detects self-play vs regular games automatically
+- Groups self-play games by unique snake ID pairs
+- Maintains complete game history from turn 0
+
+**Use cases**:
+- Organize batch game results
+- Isolate specific games for detailed analysis
+- Prepare test fixtures from live games
+
+#### `regenerate_logs` - Log Regeneration with Fixed Code
+**Location**: `src/bin/regenerate_logs.rs`
+
+Replays games with fixed algorithm and generates new JSONL files with corrected moves.
+
+```bash
+cargo run --release --bin regenerate_logs -- tests/fixtures/1v1_self/ tests/fixtures/1v1_self_fixed/
+```
+
+**Use cases**:
+- Create corrected reference logs after bug fixes
+- Generate ground truth data for testing
+- Document expected behavior changes
+
+### Performance Analysis Tools
+
+#### `analyze_performance` - Performance Statistics
+**Location**: `src/bin/analyze_performance.rs`
+
+Analyzes game logs to extract timing and search depth statistics.
+
+```bash
+cargo run --release --bin analyze_performance -- tests/fixtures/1v1_self/
+```
+
+**Output**:
+- Total games and moves analyzed
+- Game length distribution (quick, medium, long, epic)
+- Statistical summary across all games
+
+**Use cases**:
+- Identify optimization opportunities
+- Understand game length patterns
+- Plan performance improvements
+
+#### `analyze_timing` - Latency Analysis
+**Location**: `src/bin/analyze_timing.rs`
+
+Extracts latency data from game logs to analyze computation time patterns.
+
+```bash
+cargo run --release --bin analyze_timing -- tests/fixtures/1v1_self/
+```
+
+**Output**:
+- Average/median/max latency per game
+- Time budget utilization statistics
+- Games with unused time budget
+- Timeout risk identification
+- Parameter tuning recommendations
+
+**Use cases**:
+- Tune `BRANCHING_FACTOR` and `BASE_ITERATION_TIME_MS`
+- Identify games that could search deeper
+- Detect timeout risks before deployment
+
+#### `find_timeouts` - Timeout Investigation
+**Location**: `src/bin/find_timeouts.rs`
+
+Identifies specific turns with latency exceeding the time budget and exports board states.
+
+```bash
+cargo run --release --bin find_timeouts -- tests/fixtures/1v1_self/ 400
+```
+
+**Output**:
+- List of all turns exceeding threshold (default: 400ms)
+- Pattern analysis (by snake count, game phase)
+- Exports top 10 timeout board states to `/tmp/` for detailed analysis
+
+**Use cases**:
+- Understand what conditions cause time estimation failures
+- Debug iterative deepening cutoffs
+- Identify board complexity patterns that stress the algorithm
+
+### Strategic Analysis Tools
+
+#### `analyze_deaths` - Death Pattern Analysis
+**Location**: `src/bin/analyze_deaths.rs`
+
+Analyzes why snakes died and categorizes death causes.
+
+```bash
+cargo run --release --bin analyze_deaths -- tests/fixtures/1v1_self/
+```
+
+**Death categories**:
+- Starvation (health reached 0)
+- Wall collision
+- Self collision
+- Opponent collision
+- Head-to-head loss
+- Trapped (no legal moves)
+
+**Output**:
+- Death cause distribution
+- Quick games analysis (<100 turns)
+- Epic games analysis (>300 turns)
+- Strategic improvement recommendations
+
+**Use cases**:
+- Identify preventable death patterns
+- Tune evaluation function weights
+- Prioritize strategic improvements
+
+#### `analyze_battle_royale` - Multi-Snake Game Diagnostics
+**Location**: `src/bin/analyze_battle_royale.rs`
+
+Diagnoses IDAPOS and search depth issues in multiplayer games.
+
+```bash
+cargo run --release --bin analyze_battle_royale -- battle_royale_game.jsonl
+```
+
+**Output**:
+- Which snakes are "active" by IDAPOS at each depth
+- Legal moves available vs chosen moves
+- Space control analysis for each move
+- Wall collision warnings
+- IDAPOS locality masking effectiveness
+
+**Use cases**:
+- Debug multiplayer strategy issues
+- Tune `IDAPOS_HEAD_DISTANCE_MULTIPLIER`
+- Understand why certain snakes are masked
+- Verify move generation in complex scenarios
+
+### Tool Development Guidelines
+
+When creating new analysis tools:
+
+1. **Always use Rust**: Implement as binaries in `src/bin/` rather than bash/python scripts
+2. **Reuse existing modules**: Leverage `src/types.rs`, `src/config.rs`, `src/replay.rs`, etc.
+3. **Type safety first**: Rust provides compile-time guarantees that scripts cannot
+4. **Performance matters**: Rust tools run 10-100x faster than equivalent scripts
+5. **Maintainability**: Rust tools integrate with the project's build system and IDE tooling
+
+**Example tool structure**:
+```rust
+// src/bin/my_tool.rs
+use starter_snake_rust::config::Config;
+use starter_snake_rust::types::{Board, Game};
+use starter_snake_rust::replay::ReplayEngine;
+
+fn main() {
+    let config = Config::load_or_default();
+    // Tool implementation with full type safety and code reuse
+}
+```
+
 ### Replay Analysis Workflow
 
 #### 1. Identify Problematic Games

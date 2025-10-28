@@ -10,6 +10,7 @@ mod config;
 mod debug_logger;
 mod handler;
 mod replay;
+mod simple_profiler;
 mod types;
 
 #[launch]

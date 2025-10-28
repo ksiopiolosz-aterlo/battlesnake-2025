@@ -14,12 +14,14 @@ use log::info;
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::debug_logger::DebugLogger;
+use crate::simple_profiler;
 use crate::types::{Battlesnake, Board, Coord, Direction, Game};
 
 /// N-tuple score representation for MaxN algorithm
@@ -40,6 +42,147 @@ impl ScoreTuple {
     /// Gets the score for a specific player
     fn for_player(&self, player_idx: usize) -> i32 {
         self.scores.get(player_idx).copied().unwrap_or(i32::MIN)
+    }
+}
+
+/// Entry in the transposition table
+#[derive(Debug, Clone)]
+struct TranspositionEntry {
+    /// Evaluation score for this board state
+    score: i32,
+    /// Depth at which this state was evaluated
+    depth: u8,
+    /// Age for LRU eviction (generation number)
+    age: u32,
+}
+
+/// Transposition table for caching board state evaluations
+/// Uses Zobrist-style hashing to detect repeated positions
+pub struct TranspositionTable {
+    /// Hash map storing board_hash -> evaluation
+    table: RwLock<HashMap<u64, TranspositionEntry>>,
+    /// Maximum number of entries before eviction
+    max_size: usize,
+    /// Current generation for LRU eviction
+    current_age: AtomicU32,
+}
+
+impl TranspositionTable {
+    /// Creates a new transposition table with specified maximum size
+    pub fn new(max_size: usize) -> Self {
+        TranspositionTable {
+            table: RwLock::new(HashMap::with_capacity(max_size)),
+            max_size,
+            current_age: AtomicU32::new(0),
+        }
+    }
+
+    /// Hashes a board state for use as transposition table key
+    /// Includes all snake positions, healths, and food positions
+    pub fn hash_board(board: &Board) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut hasher = DefaultHasher::new();
+
+        // Hash snakes (position and health matter, not ID)
+        // Sort by position to ensure consistent hashing regardless of snake order
+        let mut snake_positions: Vec<_> = board.snakes.iter()
+            .filter(|s| s.health > 0)
+            .flat_map(|s| s.body.iter().map(move |coord| (coord.x, coord.y, s.health)))
+            .collect();
+        snake_positions.sort_unstable();
+
+        for (x, y, health) in snake_positions {
+            x.hash(&mut hasher);
+            y.hash(&mut hasher);
+            health.hash(&mut hasher);
+        }
+
+        // Hash food positions
+        let mut food_positions: Vec<_> = board.food.iter().map(|c| (c.x, c.y)).collect();
+        food_positions.sort_unstable();
+
+        for (x, y) in food_positions {
+            x.hash(&mut hasher);
+            y.hash(&mut hasher);
+        }
+
+        hasher.finish()
+    }
+
+    /// Probes the transposition table for a cached evaluation
+    /// Returns Some(score) if found and depth is sufficient, None otherwise
+    pub fn probe(&self, board_hash: u64, required_depth: u8) -> Option<i32> {
+        let table = self.table.read().ok()?;
+
+        if let Some(entry) = table.get(&board_hash) {
+            // Only use cached value if it was searched to at least the required depth
+            if entry.depth >= required_depth {
+                return Some(entry.score);
+            }
+        }
+
+        None
+    }
+
+    /// Stores an evaluation in the transposition table
+    /// Performs LRU eviction if table is full
+    pub fn store(&self, board_hash: u64, score: i32, depth: u8) {
+        let current_age = self.current_age.load(Ordering::Relaxed);
+
+        if let Ok(mut table) = self.table.write() {
+            // Evict old entries if table is full
+            if table.len() >= self.max_size {
+                let age_threshold = current_age.saturating_sub(100);
+                table.retain(|_, entry| entry.age > age_threshold);
+
+                // If still too full after age-based eviction, clear half the table
+                if table.len() >= self.max_size {
+                    let keys_to_remove: Vec<_> = table.keys()
+                        .take(self.max_size / 2)
+                        .copied()
+                        .collect();
+                    for key in keys_to_remove {
+                        table.remove(&key);
+                    }
+                }
+            }
+
+            // Store or update entry
+            match table.get_mut(&board_hash) {
+                Some(entry) if entry.depth < depth => {
+                    // Update if new depth is deeper
+                    entry.score = score;
+                    entry.depth = depth;
+                    entry.age = current_age;
+                }
+                None => {
+                    // Insert new entry
+                    table.insert(board_hash, TranspositionEntry {
+                        score,
+                        depth,
+                        age: current_age,
+                    });
+                }
+                _ => {
+                    // Existing entry is deeper, don't update
+                }
+            }
+        }
+    }
+
+    /// Increments the age counter (call at start of each search)
+    pub fn increment_age(&self) {
+        self.current_age.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns statistics about the transposition table
+    pub fn stats(&self) -> (usize, usize) {
+        if let Ok(table) = self.table.read() {
+            (table.len(), self.max_size)
+        } else {
+            (0, self.max_size)
+        }
     }
 }
 
@@ -296,6 +439,11 @@ impl Bot {
     ) {
         info!("Starting MaxN search computation");
 
+        // Create transposition table for this search
+        // Size: 100k entries = ~1.6MB memory (16 bytes per entry)
+        let tt = Arc::new(TranspositionTable::new(100_000));
+        tt.increment_age();
+
         // Determine execution strategy
         let num_alive_snakes = board.snakes.iter().filter(|s| s.health > 0).count();
         let num_cpus = rayon::current_num_threads();
@@ -311,7 +459,7 @@ impl Bot {
 
         // Select search function based on strategy (constant for entire game)
         // This hoists the match outside the iterative deepening loop to save cycles
-        let search_fn: fn(&Board, &Battlesnake, u8, &Arc<SharedSearchState>, &Config) = match strategy {
+        let search_fn: fn(&Board, &Battlesnake, u8, &Arc<SharedSearchState>, &Config, &Arc<TranspositionTable>) = match strategy {
             ExecutionStrategy::Parallel1v1 => Self::parallel_1v1_search,
             ExecutionStrategy::ParallelMultiplayer => Self::parallel_multiplayer_search,
             ExecutionStrategy::Sequential => Self::sequential_search,
@@ -361,7 +509,7 @@ impl Bot {
             let iteration_start = Instant::now();
 
             // Execute search using pre-selected function pointer
-            search_fn(board, you, current_depth, &shared, config);
+            search_fn(board, you, current_depth, &shared, config, &tt);
 
             // Record actual iteration time
             let iteration_elapsed = iteration_start.elapsed().as_millis() as u64;
@@ -375,11 +523,21 @@ impl Bot {
         }
 
         shared.search_complete.store(true, Ordering::Release);
+
+        // Merge profiling data from all threads
+        if simple_profiler::is_profiling_enabled() {
+            simple_profiler::merge_thread_local();
+        }
+
         let (best_move_idx, best_score) = shared.get_best();
+        let (tt_entries, tt_capacity) = tt.stats();
         info!(
-            "Search complete. Best move: {:?}, Score: {}",
+            "Search complete. Best move: {:?}, Score: {}, TT: {}/{} entries ({:.1}% full)",
             Self::index_to_direction(best_move_idx, config).as_str(),
-            best_score
+            best_score,
+            tt_entries,
+            tt_capacity,
+            100.0 * tt_entries as f64 / tt_capacity as f64
         );
     }
 
@@ -410,6 +568,7 @@ impl Bot {
         depth: u8,
         shared: &Arc<SharedSearchState>,
         config: &Config,
+        tt: &Arc<TranspositionTable>,
     ) {
         // Generate legal moves for our snake
         let legal_moves = Self::generate_legal_moves(board, you, config);
@@ -463,6 +622,7 @@ impl Bot {
                     i32::MAX,
                     false,
                     config,
+                    tt,
                 )
             } else {
                 // Use MaxN for multiplayer
@@ -472,6 +632,7 @@ impl Bot {
                     depth.saturating_sub(1),
                     our_idx,
                     config,
+                    tt,
                 );
                 tuple.for_player(our_idx)
             };
@@ -493,7 +654,9 @@ impl Bot {
     /// - Doesn't collide with snake bodies (excluding tails which will move)
     /// - Doesn't reverse into the neck
     /// - Avoids head-to-head collisions with equal or longer snakes (unless no other option)
-    fn generate_legal_moves(board: &Board, snake: &Battlesnake, config: &Config) -> Vec<Direction> {
+    pub fn generate_legal_moves(board: &Board, snake: &Battlesnake, config: &Config) -> Vec<Direction> {
+        let _prof = simple_profiler::ProfileGuard::new("move_gen");
+
         if snake.health <= 0 || snake.body.is_empty() {
             return vec![];
         }
@@ -629,7 +792,7 @@ impl Bot {
     }
 
     /// Converts a direction to its encoded index
-    fn direction_to_index(dir: Direction, config: &Config) -> u8 {
+    pub fn direction_to_index(dir: Direction, config: &Config) -> u8 {
         match dir {
             Direction::Up => config.direction_encoding.direction_up_index,
             Direction::Down => config.direction_encoding.direction_down_index,
@@ -656,6 +819,8 @@ impl Bot {
     /// Applies a move to a specific snake in the game state
     /// Updates snake position, handles food consumption, and decreases health
     fn apply_move(board: &mut Board, snake_idx: usize, dir: Direction, config: &Config) {
+        let _prof = simple_profiler::ProfileGuard::new("apply_move");
+
         if snake_idx >= board.snakes.len() {
             return;
         }
@@ -804,6 +969,21 @@ impl Bot {
     /// Accounts for snake bodies that will move over time
     /// Returns the number of cells reachable
     fn flood_fill_bfs(board: &Board, start: Coord, snake_idx: usize) -> usize {
+        let _prof = simple_profiler::ProfileGuard::new("flood_fill");
+
+        // Pre-build obstacle map for O(1) lookups (huge performance improvement)
+        // Maps each occupied cell to the number of turns until it becomes free
+        let mut obstacles: HashMap<Coord, usize> = HashMap::new();
+        for snake in &board.snakes {
+            if snake.health <= 0 {
+                continue;
+            }
+            for (seg_idx, &segment) in snake.body.iter().enumerate() {
+                let segments_from_tail = snake.body.len() - seg_idx;
+                obstacles.insert(segment, segments_from_tail);
+            }
+        }
+
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
 
@@ -827,9 +1007,11 @@ impl Bot {
                     continue;
                 }
 
-                // Check if blocked (accounting for bodies that will move)
-                if Self::is_position_blocked_at_time(board, next, turns, snake_idx) {
-                    continue;
+                // Check if blocked using pre-built obstacle map (O(1) instead of O(snakes × length))
+                if let Some(&segments_from_tail) = obstacles.get(&next) {
+                    if segments_from_tail > turns {
+                        continue; // Still blocked
+                    }
                 }
 
                 visited.insert(next);
@@ -868,23 +1050,58 @@ impl Bot {
 
     /// Adversarial flood fill - simultaneous BFS from all snake heads
     /// Returns map of which snake controls each cell (longer snakes win ties)
-    fn adversarial_flood_fill(board: &Board) -> HashMap<Coord, usize> {
+    ///
+    /// If active_snakes is empty, processes all snakes.
+    /// Otherwise, only processes snakes in the provided list (IDAPOS optimization).
+    fn adversarial_flood_fill(board: &Board, active_snakes: &[usize]) -> HashMap<Coord, usize> {
+        let _prof = simple_profiler::ProfileGuard::new("adversarial_flood_fill");
+
         let mut control_map: HashMap<Coord, usize> = HashMap::new();
         let mut distance_map: HashMap<Coord, usize> = HashMap::new();
 
+        // Determine which snakes to process
+        let process_all = active_snakes.is_empty();
+
         // Mark snake bodies as obstacles controlled by their owner
-        for (idx, snake) in board.snakes.iter().enumerate() {
-            if snake.health <= 0 {
-                continue;
+        if process_all {
+            for (idx, snake) in board.snakes.iter().enumerate() {
+                if snake.health <= 0 {
+                    continue;
+                }
+                for &seg in &snake.body {
+                    control_map.insert(seg, idx);
+                }
             }
-            for &seg in &snake.body {
-                control_map.insert(seg, idx);
+        } else {
+            for &idx in active_snakes {
+                if idx >= board.snakes.len() {
+                    continue;
+                }
+                let snake = &board.snakes[idx];
+                if snake.health <= 0 {
+                    continue;
+                }
+                for &seg in &snake.body {
+                    control_map.insert(seg, idx);
+                }
             }
         }
 
         // Sort snakes by length (longer snakes win ties)
-        let mut snakes_sorted: Vec<(usize, &Battlesnake)> =
-            board.snakes.iter().enumerate().collect();
+        let mut snakes_sorted: Vec<(usize, &Battlesnake)> = if process_all {
+            board.snakes.iter().enumerate().collect()
+        } else {
+            active_snakes
+                .iter()
+                .filter_map(|&idx| {
+                    if idx < board.snakes.len() {
+                        Some((idx, &board.snakes[idx]))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
         snakes_sorted.sort_by_key(|(_, s)| std::cmp::Reverse(s.length));
 
         // Simultaneous BFS from all heads
@@ -920,9 +1137,9 @@ impl Bot {
 
                 let next_dist = dist + 1;
 
-                // Only explore if we can reach it faster or at same distance
+                // Only explore if we can reach it faster (not equal distance - prevents re-exploration)
                 let should_explore = match distance_map.get(&next) {
-                    Some(&existing_dist) => next_dist <= existing_dist,
+                    Some(&existing_dist) => next_dist < existing_dist,
                     None => true,
                 };
 
@@ -934,6 +1151,25 @@ impl Bot {
         }
 
         control_map
+    }
+
+    /// Helper to compute control score from pre-computed map
+    fn compute_control_score_from_map(
+        control_map: &HashMap<Coord, usize>,
+        snake_idx: usize,
+        config: &Config,
+    ) -> i32 {
+        let our_cells = control_map
+            .values()
+            .filter(|&&owner| owner == snake_idx)
+            .count();
+        let total_free = control_map.len();
+
+        if total_free == 0 {
+            return 0;
+        }
+
+        ((our_cells as f32 / total_free as f32) * config.scores.territory_scale_factor) as i32
     }
 
     /// Computes health and food score for a snake
@@ -1039,7 +1275,7 @@ impl Bot {
             return 0;
         }
 
-        let control_map = Self::adversarial_flood_fill(board);
+        let control_map = Self::adversarial_flood_fill(board, &[]);
 
         let our_cells = control_map
             .values()
@@ -1149,15 +1385,72 @@ impl Bot {
         0
     }
 
+    /// Computes wall proximity penalty to discourage moves toward boundaries
+    /// Uses formula: penalty = -wall_penalty_base / (distance + 1)
+    /// Examples: distance=0 → -10000, distance=1 → -5000, distance=2 → -3333
+    /// Caps at distance >= 3 (safe distance)
+    fn compute_wall_penalty(pos: Coord, width: i32, height: i32, config: &Config) -> i32 {
+        let dist_to_wall = [
+            pos.x,                  // distance to left wall
+            width - 1 - pos.x,      // distance to right wall
+            pos.y,                  // distance to bottom wall
+            height - 1 - pos.y,     // distance to top wall
+        ]
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(0);
+
+        // Cap at safe distance from wall
+        if dist_to_wall >= config.scores.safe_distance_from_wall {
+            return 0;
+        }
+
+        // Apply mathematical formula for smooth gradient
+        // Penalty decreases as distance increases
+        -(config.scores.wall_penalty_base / (dist_to_wall + 1))
+    }
+
+    /// Computes center bias to encourage staying in central board positions
+    /// Central positions provide more escape routes and avoid dead ends
+    fn compute_center_bias(pos: Coord, width: i32, height: i32, config: &Config) -> i32 {
+        let center_x = width / 2;
+        let center_y = height / 2;
+        let dist_from_center = (pos.x - center_x).abs() + (pos.y - center_y).abs();
+
+        // Prefer central positions
+        // Center = +100, edges = 0 or negative
+        100 - (dist_from_center * config.scores.center_bias_multiplier)
+    }
+
     /// Evaluates the current game state for all snakes
     /// Returns an N-tuple of scores (one per snake)
+    ///
+    /// # Parameters
+    /// * `active_snakes` - Optional set of snake indices to evaluate in detail (from IDAPOS)
+    ///                     If None, evaluates all snakes fully
     fn evaluate_state(
         board: &Board,
         our_snake_id: &str,
         config: &Config,
+        active_snakes: Option<&[usize]>,
     ) -> ScoreTuple {
+        let _prof = simple_profiler::ProfileGuard::new("eval");
+
         let num_snakes = board.snakes.len();
         let mut scores = vec![0i32; num_snakes];
+
+        // Compute territory control ONCE for active snakes only (major optimization!)
+        // If active_snakes is empty, processes all snakes. Otherwise, only processes filtered snakes.
+        let control_map = if let Some(active) = active_snakes {
+            if active.is_empty() {
+                None
+            } else {
+                Some(Self::adversarial_flood_fill(board, active))
+            }
+        } else {
+            Some(Self::adversarial_flood_fill(board, &[]))
+        };
 
         for (idx, snake) in board.snakes.iter().enumerate() {
             if snake.health <= 0 {
@@ -1165,19 +1458,55 @@ impl Bot {
                 continue;
             }
 
+            // Check if this snake is active (needs full evaluation)
+            let is_active = active_snakes.map_or(true, |active| active.contains(&idx));
+
             // Multi-component evaluation
             let survival = 0; // Alive = 0 penalty
             let health = Self::compute_health_score(board, idx, config);
-            let space = Self::compute_space_score(board, idx, config);
-            let control = Self::compute_control_score(board, idx, config);
+
+            // Only compute expensive space control for active snakes (IDAPOS optimization)
+            let space = if is_active {
+                Self::compute_space_score(board, idx, config)
+            } else {
+                0
+            };
+
+            // Only compute expensive control and attack for active snakes
+            let control = if is_active {
+                if let Some(ref map) = control_map {
+                    Self::compute_control_score_from_map(map, idx, config)
+                } else {
+                    0
+                }
+            } else {
+                0  // Skip expensive territory control for non-active snakes
+            };
+
             let length = snake.length * config.scores.weight_length;
-            let attack = Self::compute_attack_score(board, idx, config);
+
+            let attack = if is_active {
+                Self::compute_attack_score(board, idx, config)
+            } else {
+                0  // Skip expensive attack calculation for non-active snakes
+            };
 
             // Check for head-to-head collision danger
             let head_collision_danger = if !snake.body.is_empty() {
                 Self::check_head_collision_danger(board, idx, snake.body[0], config)
             } else {
                 0
+            };
+
+            // Wall proximity penalty and center bias
+            let (wall_penalty, center_bias) = if !snake.body.is_empty() {
+                let head = snake.body[0];
+                (
+                    Self::compute_wall_penalty(head, board.width as i32, board.height as i32, config),
+                    Self::compute_center_bias(head, board.width as i32, board.height as i32, config),
+                )
+            } else {
+                (0, 0)
             };
 
             // Weighted combination
@@ -1188,7 +1517,9 @@ impl Bot {
                 + (config.scores.weight_control * control as f32) as i32
                 + (config.scores.weight_attack * attack as f32) as i32
                 + length
-                + head_collision_danger;
+                + head_collision_danger
+                + wall_penalty
+                + center_bias;
         }
 
         // Apply survival penalty if our snake is dead
@@ -1280,6 +1611,7 @@ impl Bot {
         our_idx: usize,
         opponent_idx: usize,
         config: &Config,
+        tt: &Arc<TranspositionTable>,
     ) -> ScoreTuple {
         // Create a simplified 2-player board with only the active snakes
         let mut simplified_board = board.clone();
@@ -1300,6 +1632,7 @@ impl Bot {
             i32::MAX,
             true,
             config,
+            tt,
         );
 
         // Create score tuple with our score and opponent's inverse
@@ -1319,11 +1652,17 @@ impl Bot {
         depth: u8,
         current_player_idx: usize,
         config: &Config,
+        tt: &Arc<TranspositionTable>,
     ) -> ScoreTuple {
-        // Terminal conditions
-        if depth == 0 || Self::is_terminal(board, our_snake_id, config) {
-            return Self::evaluate_state(board, our_snake_id, config);
+        let _prof = simple_profiler::ProfileGuard::new("maxn");
+
+        // Probe transposition table
+        let board_hash = TranspositionTable::hash_board(board);
+        if let Some(cached_score) = tt.probe(board_hash, depth) {
+            simple_profiler::record_tt_lookup(true);
+            return ScoreTuple::new_with_value(board.snakes.len(), cached_score);
         }
+        simple_profiler::record_tt_lookup(false);
 
         let our_idx = board
             .snakes
@@ -1332,7 +1671,15 @@ impl Bot {
             .unwrap_or(0);
 
         // IDAPOS: Determine active (local) snakes to reduce branching
+        // Do this BEFORE terminal evaluation so we can optimize evaluation too
         let active_snakes = Self::determine_active_snakes(board, our_snake_id, depth, config);
+
+        // Terminal conditions
+        if depth == 0 || Self::is_terminal(board, our_snake_id, config) {
+            let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes));
+            tt.store(board_hash, eval.for_player(our_idx), depth);
+            return eval;
+        }
 
         // If only 2 snakes are active and we're one of them, use alpha-beta
         if active_snakes.len() == config.idapos.min_snakes_for_alpha_beta
@@ -1352,6 +1699,7 @@ impl Bot {
                 our_idx,
                 opponent_idx,
                 config,
+                tt,
             );
         }
 
@@ -1362,7 +1710,7 @@ impl Bot {
         {
             // Skip to next player
             let next = (current_player_idx + 1) % board.snakes.len();
-            return Self::maxn_search(board, our_snake_id, depth, next, config);
+            return Self::maxn_search(board, our_snake_id, depth, next, config, tt);
         }
 
         // Generate legal moves for current player
@@ -1373,7 +1721,7 @@ impl Bot {
             let mut dead_board = board.clone();
             dead_board.snakes[current_player_idx].health = 0;
             let next = (current_player_idx + 1) % board.snakes.len();
-            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config);
+            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config, tt);
         }
 
         let mut best_tuple =
@@ -1389,10 +1737,10 @@ impl Bot {
             let child_tuple = if all_moved {
                 // All snakes have moved - advance game state and reduce depth
                 Self::advance_game_state(&mut child_board);
-                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config)
+                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config, tt)
             } else {
                 // Continue with next player at same depth
-                Self::maxn_search(&child_board, our_snake_id, depth, next, config)
+                Self::maxn_search(&child_board, our_snake_id, depth, next, config, tt)
             };
 
             // Update if current player improves their score
@@ -1408,6 +1756,8 @@ impl Bot {
             }
         }
 
+        // Store result in transposition table before returning
+        tt.store(board_hash, best_tuple.for_player(our_idx), depth);
         best_tuple
     }
 
@@ -1421,15 +1771,29 @@ impl Bot {
         mut beta: i32,
         is_max: bool,
         config: &Config,
+        tt: &Arc<TranspositionTable>,
     ) -> i32 {
+        let _prof = simple_profiler::ProfileGuard::new("alpha_beta");
+
+        // Probe transposition table
+        let board_hash = TranspositionTable::hash_board(board);
+        if let Some(cached_score) = tt.probe(board_hash, depth) {
+            simple_profiler::record_tt_lookup(true);
+            return cached_score;
+        }
+        simple_profiler::record_tt_lookup(false);
+
         if depth == 0 || Self::is_terminal(board, our_snake_id, config) {
-            let scores = Self::evaluate_state(board, our_snake_id, config);
+            // In alpha-beta (1v1), no need to filter - only 2 snakes
+            let scores = Self::evaluate_state(board, our_snake_id, config, None);
             let our_idx = board
                 .snakes
                 .iter()
                 .position(|s| &s.id == our_snake_id)
                 .unwrap_or(0);
-            return scores.for_player(our_idx);
+            let score = scores.for_player(our_idx);
+            tt.store(board_hash, score, depth);
+            return score;
         }
 
         let our_idx = board
@@ -1454,7 +1818,7 @@ impl Bot {
 
         if player_idx >= board.snakes.len() || board.snakes[player_idx].health <= 0 {
             // Player is dead, return evaluation
-            let scores = Self::evaluate_state(board, our_snake_id, config);
+            let scores = Self::evaluate_state(board, our_snake_id, config, None);
             return scores.for_player(our_idx);
         }
 
@@ -1471,6 +1835,7 @@ impl Bot {
                 beta,
                 !is_max,
                 config,
+                tt,
             );
         }
 
@@ -1489,13 +1854,16 @@ impl Bot {
                     beta,
                     false,
                     config,
+                    tt,
                 );
                 max_eval = max_eval.max(eval);
                 alpha = alpha.max(eval);
                 if beta <= alpha {
+                    simple_profiler::record_alpha_beta_cutoff();
                     break; // Beta cutoff
                 }
             }
+            tt.store(board_hash, max_eval, depth);
             max_eval
         } else {
             let mut min_eval = i32::MAX;
@@ -1512,13 +1880,16 @@ impl Bot {
                     beta,
                     true,
                     config,
+                    tt,
                 );
                 min_eval = min_eval.min(eval);
                 beta = beta.min(eval);
                 if beta <= alpha {
+                    simple_profiler::record_alpha_beta_cutoff();
                     break; // Alpha cutoff
                 }
             }
+            tt.store(board_hash, min_eval, depth);
             min_eval
         }
     }
@@ -1531,6 +1902,7 @@ impl Bot {
         depth: u8,
         shared: &Arc<SharedSearchState>,
         config: &Config,
+        tt: &Arc<TranspositionTable>,
     ) {
         let legal_moves = Self::generate_legal_moves(board, you, config);
 
@@ -1577,6 +1949,7 @@ impl Bot {
                 depth.saturating_sub(1),
                 our_idx,
                 config,
+                tt,
             );
             let our_score = tuple.for_player(our_idx);
 
@@ -1599,6 +1972,7 @@ impl Bot {
         depth: u8,
         shared: &Arc<SharedSearchState>,
         config: &Config,
+        tt: &Arc<TranspositionTable>,
     ) {
         let legal_moves = Self::generate_legal_moves(board, you, config);
 
@@ -1647,6 +2021,7 @@ impl Bot {
                 i32::MAX,
                 false,
                 config,
+                tt,
             );
 
             // Atomic update of best move and score together (prevents race conditions)
