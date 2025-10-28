@@ -110,14 +110,30 @@ These are tunable parameters (consider externalizing to a config file):
 
 ## Development Process
 1. Make code changes following the style guide
-2. **IMPORTANT**: Validate compilation via `cargo build` and resolve all compiler errors
+2. **IMPORTANT**: Validate compilation and resolve all compiler errors
 3. Run static analysis tools to catch issues
 4. **Default behavior**: Do NOT generate tests unless explicitly requested
+
+## Build & Test Commands
+- **CRITICAL**: This environment has limited disk space. ALWAYS use `--release` flag for all cargo commands
+- **Build**: `cargo build --release`
+- **Test**: `cargo test --release`
+- **Run**: `cargo run --release`
+- **Clean**: Run `cargo clean` if disk space issues occur, but prefer using `--release` consistently
+- **Rationale**: Release builds are faster and smaller. Dependencies are already compiled in release mode.
 
 ## Testing
 - Test format: JSON input matching existing data contracts
 - **MUST** clarify expectations if requirements are vague or unclear
 - Run targeted tests (single test or small subset) rather than full suite for performance
+- **ALWAYS** use `cargo test --release` for running tests
+
+### Replay Integration Tests
+- The replay integration tests require the `replay` binary to be built
+- The test suite automatically builds the replay binary before running tests
+- This is handled by `ensure_replay_binary_built()` in `tests/replay_integration_tests.rs`
+- The binary is built in the same profile as the tests (debug or release)
+- No manual build step is required - just run `cargo test --release` as usual
 
 ---
 
@@ -995,7 +1011,9 @@ Assume opponents prioritize:
 3. Food acquisition
 
 ## Compilation
-Please ensure all code changes are saved before attempting to compile. Unless otherwise stated, you should not attempt to compile via cargo and instead advise the user to do it
+- **CRITICAL**: ALWAYS use `cargo build --release` and `cargo test --release` due to limited disk space
+- Please ensure all code changes are saved before attempting to compile
+- Unless otherwise stated, you should not attempt to compile via cargo and instead advise the user to do it
 
 ---
 

@@ -4,7 +4,14 @@
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
       "Bash(git add:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Read(///**)",
+      "Bash(cat:*)",
+      "Bash(awk:*)",
+      "Bash(mkdir:*)",
+      "Read(//tmp/**)",
+      "Bash(bash)",
+      "Bash(cargo clean:*)"
     ],
     "deny": [],
     "ask": []

@@ -8,6 +8,35 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Once;
+
+static INIT: Once = Once::new();
+
+/// Ensures the replay binary is built before running any tests.
+/// This is called once before the first test runs.
+fn ensure_replay_binary_built() {
+    INIT.call_once(|| {
+        eprintln!("Building replay binary for integration tests...");
+
+        // Detect build profile
+        #[cfg(debug_assertions)]
+        let profile_args = vec!["build", "--bin", "replay"];
+        #[cfg(not(debug_assertions))]
+        let profile_args = vec!["build", "--bin", "replay", "--release"];
+
+        let status = Command::new("cargo")
+            .args(&profile_args)
+            .status()
+            .expect("Failed to execute cargo build");
+
+        assert!(
+            status.success(),
+            "Failed to build replay binary as test dependency"
+        );
+
+        eprintln!("Replay binary built successfully.");
+    });
+}
 
 /// Helper function to get the path to test fixtures
 fn fixture_path(filename: &str) -> PathBuf {
@@ -21,13 +50,23 @@ fn fixture_path(filename: &str) -> PathBuf {
 fn replay_binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target");
-    path.push("debug");
+
+    // Detect build profile: release if running release tests, otherwise debug
+    #[cfg(debug_assertions)]
+    let profile = "debug";
+    #[cfg(not(debug_assertions))]
+    let profile = "release";
+
+    path.push(profile);
     path.push("replay");
     path
 }
 
 /// Helper to run replay binary with arguments
 fn run_replay(args: &[&str]) -> std::process::Output {
+    // Ensure the replay binary is built before running
+    ensure_replay_binary_built();
+
     Command::new(replay_binary_path())
         .args(args)
         .output()
