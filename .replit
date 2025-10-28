@@ -26,7 +26,7 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "cargo run --release"
+args = "cargo run --bin starter-snake-rust --release"
 waitForPort = 5000
 
 [[ports]]
@@ -35,4 +35,4 @@ externalPort = 80
 
 [deployment]
 deploymentTarget = "vm"
-run = ["cargo", "run", "--release"]
+run = ["cargo", "run", "--bin", "starter-snake-rust", "--release"]
