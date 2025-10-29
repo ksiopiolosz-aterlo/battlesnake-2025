@@ -83,6 +83,17 @@ pub struct StrategyConfig {
 /// All evaluation and scoring constants
 #[derive(Debug, Deserialize, Clone)]
 pub struct ScoresConfig {
+    // Temporal discounting
+    pub temporal_discount_factor: f32,
+
+    // V8: Hierarchical evaluation
+    pub survival_max_multiplier: f32,
+    pub survival_health_threshold: u8,
+
+    // V8: Growth strategy
+    pub growth_urgency_per_length: i32,
+    pub growth_bonus_when_ahead: i32,
+
     // Survival scores
     pub score_dead_snake: i32,
     pub score_survival_penalty: i32,
@@ -177,6 +188,7 @@ pub struct ScoresConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct IdaposConfig {
     pub head_distance_multiplier: i32,
+    pub max_locality_distance: i32,
     pub min_snakes_for_alpha_beta: usize,
 }
 
@@ -295,6 +307,11 @@ impl Config {
                 min_cpus_for_parallel: 2,
             },
             scores: ScoresConfig {
+                temporal_discount_factor: 0.95,
+                survival_max_multiplier: 1000.0,
+                survival_health_threshold: 20,
+                growth_urgency_per_length: 500,
+                growth_bonus_when_ahead: 100,
                 score_dead_snake: i32::MIN + 1000,
                 score_survival_penalty: -1_000_000,
                 score_survival_weight: 1000.0,
@@ -354,6 +371,7 @@ impl Config {
             },
             idapos: IdaposConfig {
                 head_distance_multiplier: 1,  // Aggressive locality masking: only snakes within depth distance
+                max_locality_distance: 5,     // Cap to prevent over-inclusion at high depths
                 min_snakes_for_alpha_beta: 2,
             },
             move_ordering: MoveOrderingConfig {

@@ -95,6 +95,27 @@ min_cpus_for_parallel = 2
 # ============================================================================
 [scores]
 
+# Temporal Discounting
+# Discount factor applied per search depth to reduce weight of distant predictions
+# V7.2: Addresses issue where distant future penalties overwhelm immediate food rewards
+# Example with discount_factor = 0.95:
+#   Depth 0: score × 1.0 (immediate - full weight)
+#   Depth 5: score × 0.77 (0.95^5)
+#   Depth 10: score × 0.60 (0.95^10)
+# At 0.95: immediate +1.875M food stays dominant, depth-5 -5000 penalty → -3850
+temporal_discount_factor = 0.95
+
+# V8: Hierarchical Evaluation System
+# Separates safety vetoes, survival needs, tactical play, and strategic positioning
+# Prevents single components from dominating decision-making
+survival_max_multiplier = 1000.0     # Cap urgency multiplier (not unlimited)
+survival_health_threshold = 20       # Health level to activate survival mode
+
+# V8: Growth Strategy
+# Incentivize growth when shorter than opponents
+growth_urgency_per_length = 500      # Bonus per length unit behind smallest opponent
+growth_bonus_when_ahead = 100        # Small bonus when already longest
+
 # Survival Scores
 # Score penalty for dead snake
 score_dead_snake = -2147482648  # i32::MIN + 1000
@@ -268,6 +289,11 @@ articulation_point_enabled = true       # Enable/disable articulation point dete
 # At depth 3: considers snakes within distance 3 (was 6)
 # This reduces branching factor significantly in battle royale
 head_distance_multiplier = 1
+# Maximum locality distance cap (prevents over-inclusion at high depths)
+# At depth 10 with multiplier 1, we'd consider distance 10 (entire 11x11 board!)
+# Cap at 5 ensures we only consider threats within 5 moves regardless of depth
+# This maintains IDAPOS effectiveness even when achieving depth 8-10
+max_locality_distance = 5
 # Min snakes in locality to switch to alpha-beta
 min_snakes_for_alpha_beta = 2
 
@@ -322,7 +348,7 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "optimized_v7.jsonl"
+log_file_path = "optimized_v8.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration

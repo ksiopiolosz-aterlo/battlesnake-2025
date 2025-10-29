@@ -1162,6 +1162,7 @@ impl Bot {
                     &child_board,
                     our_snake_id,
                     depth.saturating_sub(1),
+                    1,  // One ply down from root after applying move
                     alpha,
                     beta,
                     false,
@@ -1176,6 +1177,7 @@ impl Bot {
                     &child_board,
                     our_snake_id,
                     depth.saturating_sub(1),
+                    1, // One ply down from root
                     our_idx,
                     config,
                     tt,
@@ -1805,7 +1807,12 @@ impl Bot {
     /// Computes health and food score for a snake
     /// Returns higher score for closer food when health is low
     /// Adds extra urgency when in health disadvantage vs opponents
-    fn compute_health_score(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+    fn compute_health_score(
+        board: &Board,
+        snake_idx: usize,
+        active_snakes: &[usize],
+        config: &Config,
+    ) -> i32 {
         if snake_idx >= board.snakes.len() {
             return config.scores.score_zero_health;
         }
@@ -1834,6 +1841,7 @@ impl Bot {
         // Immediate food bonus: strongly incentivize grabbing adjacent food
         // This overrides normal distance penalty to ensure we eat when safe
         // V6 fix: Check escape routes before eating food to avoid "grab and die" pattern
+        // V7.1 fix: Add urgency multiplier for distance-1 food when health is low
         if nearest_food_dist <= config.scores.immediate_food_distance && snake.health < 100 {
             // Find the nearest food position
             let nearest_food = board
@@ -1841,6 +1849,33 @@ impl Bot {
                 .iter()
                 .min_by_key(|&food| manhattan_distance(head, *food))
                 .copied();
+
+            // V8: Use smarter food safety check that predicts post-eating traps
+            let is_food_safe = if let Some(food_pos) = nearest_food {
+                Self::is_food_actually_safe(board, food_pos, snake_idx, active_snakes, config)
+            } else {
+                false
+            };
+
+            // V8: Hierarchical urgency multiplier with configurable cap
+            // Prevents unlimited multipliers from dominating ALL other factors
+            // survival_max_multiplier (default 1000.0) ensures survival layer dominates tactical,
+            // but safety vetoes can still block dangerous moves
+            let urgency_multiplier = if nearest_food_dist == 1 && is_food_safe {
+                // Adjacent safe food - use urgency based on health threshold
+                if snake.health < config.scores.survival_health_threshold as i32 {
+                    // CRITICAL survival mode: max multiplier
+                    config.scores.survival_max_multiplier
+                } else if snake.health < 70 {
+                    // Moderate urgency: 10% of max
+                    config.scores.survival_max_multiplier * 0.1
+                } else {
+                    // Low urgency: 1% of max
+                    config.scores.survival_max_multiplier * 0.01
+                }
+            } else {
+                1.0  // Normal: Food at distance 2 or food is guarded
+            };
 
             // Check escape routes after eating this food
             if let Some(food_pos) = nearest_food {
@@ -1870,11 +1905,14 @@ impl Bot {
                         0
                     };
 
-                    return config.scores.immediate_food_bonus + penalty + safe_food_bonus;
+                    // Apply urgency multiplier to the total bonus
+                    let base_bonus = config.scores.immediate_food_bonus + penalty + safe_food_bonus;
+                    return (base_bonus as f32 * urgency_multiplier) as i32;
                 }
             }
 
-            return config.scores.immediate_food_bonus;
+            // No escape route penalty - just apply urgency multiplier to base bonus
+            return (config.scores.immediate_food_bonus as f32 * urgency_multiplier) as i32;
         }
 
         // Urgency increases as health decreases
@@ -1895,22 +1933,27 @@ impl Bot {
             return config.scores.score_starvation_base + distance_penalty;
         }
 
-        // Check if we're in a health disadvantage against nearby opponents
+        // Check if we're in a health disadvantage against nearby opponents (IDAPOS-filtered)
         // This helps break out of "death dance" scenarios where both snakes circle endlessly
-        // Only consider opponents that are close enough to be an immediate threat
-        let max_nearby_opponent_health = board
-            .snakes
+        // Only consider ACTIVE opponents that are close enough to be an immediate threat
+        let max_nearby_opponent_health = active_snakes
             .iter()
-            .enumerate()
-            .filter(|(idx, s)| {
-                if *idx == snake_idx || s.health <= 0 || s.body.is_empty() {
-                    return false;
+            .filter_map(|&idx| {
+                if idx == snake_idx || idx >= board.snakes.len() {
+                    return None;
+                }
+                let s = &board.snakes[idx];
+                if s.health <= 0 || s.body.is_empty() {
+                    return None;
                 }
                 // Only consider opponents within threat range
                 let dist = manhattan_distance(head, s.body[0]);
-                dist <= config.scores.health_threat_distance
+                if dist <= config.scores.health_threat_distance {
+                    Some(s.health)
+                } else {
+                    None
+                }
             })
-            .map(|(_, s)| s.health)
             .max()
             .unwrap_or(0);
 
@@ -2330,6 +2373,93 @@ impl Bot {
         legal_moves
     }
 
+    /// V8: Smarter food safety check - predicts opponent behavior and post-eating traps
+    /// Fixes V7.2 issue where food marked "SAFE" but opponent could trap us after eating
+    ///
+    /// Checks:
+    /// 1. Can opponent reach food before/simultaneously?
+    /// 2. Does opponent WANT this food? (hungry or competitive length)
+    /// 3. Can opponent cut us off AFTER we eat? (escape route analysis)
+    ///
+    /// Example failure (V7.2 Turn 36):
+    /// - Food at (3,10), our head at (3,9) - distance 1
+    /// - Opponent at distance 2, length 7 vs our length 3
+    /// - Old code: marked "SAFE" (opponent not within distance 2 of food)
+    /// - Reality: Opponent traps us against top wall after we eat
+    /// - V8 fix: Checks escape routes POST-eating with opponent in pursuit
+    fn is_food_actually_safe(
+        board: &Board,
+        food_pos: Coord,
+        snake_idx: usize,
+        active_snakes: &[usize],
+        config: &Config,
+    ) -> bool {
+        if snake_idx >= board.snakes.len() {
+            return false;
+        }
+
+        let our_snake = &board.snakes[snake_idx];
+        if our_snake.body.is_empty() {
+            return false;
+        }
+
+        let our_head = our_snake.body[0];
+        let our_dist = manhattan_distance(our_head, food_pos);
+
+        // Check each ACTIVE opponent (IDAPOS-filtered)
+        for &opp_idx in active_snakes {
+            if opp_idx == snake_idx || opp_idx >= board.snakes.len() {
+                continue;
+            }
+
+            let opp = &board.snakes[opp_idx];
+            if opp.health <= 0 || opp.body.is_empty() {
+                continue;
+            }
+
+            let opp_head = opp.body[0];
+            let opp_dist = manhattan_distance(opp_head, food_pos);
+
+            // Check 1: Can they arrive first or simultaneously?
+            if opp_dist <= our_dist {
+                // Will they want this food?
+                // - Hungry snakes (health < 60) will contest any food
+                // - Competitive snakes (similar/smaller length) will contest for growth
+                let is_hungry = opp.health < 60;
+                let is_competitive = opp.length <= our_snake.length + 2; // Within 2 length
+
+                if is_hungry || is_competitive {
+                    return false; // They'll contest it
+                }
+            }
+
+            // Check 2: Can they cut us off AFTER we eat?
+            // If opponent is close and has length advantage, they can pressure us
+            if opp_dist <= our_dist + 2 && opp.length >= our_snake.length {
+                // Count escape routes after eating, assuming opponent moves toward us
+                let escape_count = Self::count_escape_routes_after_eating(board, snake_idx, food_pos);
+
+                // If we'd have insufficient escape routes, opponent can trap us
+                // Note: config.scores.escape_route_min is typically 2
+                if escape_count < config.scores.escape_route_min {
+                    return false; // They can trap us post-eating
+                }
+
+                // Additional check: Is food near a wall/corner? (more dangerous)
+                let dist_to_wall = food_pos.x.min(food_pos.y)
+                    .min(board.width as i32 - 1 - food_pos.x)
+                    .min(board.height as i32 - 1 - food_pos.y);
+
+                // Food within 1 cell of wall + nearby opponent with advantage = DANGER
+                if dist_to_wall <= 1 && opp.length > our_snake.length {
+                    return false; // Wall trap risk too high
+                }
+            }
+        }
+
+        true // Safe from all active opponents
+    }
+
     /// Computes length advantage bonus to encourage growth
     /// V5 fix: Bot stayed small (length 6) while opponents grew (length 19)
     fn compute_length_advantage(board: &Board, snake_idx: usize, config: &Config) -> i32 {
@@ -2360,6 +2490,55 @@ impl Bot {
         // Bonus for being longer than median, penalty for being shorter
         let length_diff = our_length - median_length;
         length_diff * config.scores.length_advantage_bonus
+    }
+
+    /// V8: Computes growth urgency based on opponent lengths (IDAPOS-filtered)
+    /// Strongly incentivizes growth when significantly shorter than opponents
+    /// Example failure (V7.2 Turn 36): Our length 3 vs opponent length 7 = 4 unit gap
+    /// With growth_urgency_per_length=500, this generates +2000 bonus to close gap
+    fn compute_growth_urgency(
+        board: &Board,
+        snake_idx: usize,
+        active_snakes: &[usize],
+        config: &Config,
+    ) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let our_snake = &board.snakes[snake_idx];
+        let our_length = our_snake.length;
+        let our_health = our_snake.health;
+
+        // Find shortest ACTIVE opponent (IDAPOS-filtered)
+        let min_opp_length = active_snakes
+            .iter()
+            .filter_map(|&idx| {
+                if idx == snake_idx || idx >= board.snakes.len() {
+                    return None;
+                }
+                let s = &board.snakes[idx];
+                if s.health > 0 {
+                    Some(s.length as i32)
+                } else {
+                    None
+                }
+            })
+            .min()
+            .unwrap_or(100); // If no opponents, assume we're fine
+
+        // If we're shorter than smallest opponent, GROW URGENTLY
+        if (our_length as i32) < min_opp_length {
+            let gap = min_opp_length - (our_length as i32);
+            return gap * config.scores.growth_urgency_per_length;
+        }
+
+        // If we're longest and healthy, grow conservatively
+        if (our_length as i32) > min_opp_length && our_health > 60 {
+            return config.scores.growth_bonus_when_ahead;
+        }
+
+        0
     }
 
     /// V7: Detects tail-chasing pattern (body segments clustering near head)
@@ -2593,6 +2772,7 @@ impl Bot {
         our_snake_id: &str,
         config: &Config,
         active_snakes: Option<&[usize]>,
+        depth_from_root: u8,
     ) -> ScoreTuple {
         let _prof = simple_profiler::ProfileGuard::new("eval");
 
@@ -2636,7 +2816,8 @@ impl Bot {
 
             // Multi-component evaluation
             let survival = 0; // Alive = 0 penalty
-            let health = Self::compute_health_score(board, idx, config);
+            let active_list = active_snakes.unwrap_or(&[]);
+            let health = Self::compute_health_score(board, idx, active_list, config);
 
             // Compute space score with entrapment detection
             // Uses IDAPOS-filtered active snakes for adversarial entrapment detection
@@ -2688,6 +2869,15 @@ impl Bot {
             // Length advantage bonus
             let length_advantage = Self::compute_length_advantage(board, idx, config);
 
+            // V8: Growth urgency - incentivize growth when shorter than opponents
+            // Uses IDAPOS-filtered active snakes to compare lengths efficiently
+            let growth_urgency = if is_active {
+                let active_list = active_snakes.unwrap_or(&[]);
+                Self::compute_growth_urgency(board, idx, active_list, config)
+            } else {
+                0  // Skip for non-active snakes
+            };
+
             // V7: Tail-chasing detection (nuanced - only when opponents nearby)
             // Uses IDAPOS-filtered active snakes to check for nearby opponents
             let tail_chasing_penalty = if is_active {
@@ -2718,7 +2908,7 @@ impl Bot {
                 + wall_penalty
                 + center_bias
                 + corner_danger
-                + length_advantage
+                + length_advantage + growth_urgency
                 + tail_chasing_penalty
                 + articulation_penalty;
         }
@@ -2727,6 +2917,15 @@ impl Bot {
         if let Some(our_idx) = board.snakes.iter().position(|s| s.id == our_snake_id) {
             if board.snakes[our_idx].health <= 0 {
                 scores[our_idx] = config.scores.score_survival_penalty;
+            }
+        }
+
+        // V7.2: Apply temporal discounting - future scores less confident, weighted lower
+        // discount = (0.95 ^ depth): depth 0 = 1.0, depth 5 = 0.77, depth 10 = 0.60
+        if depth_from_root > 0 {
+            let discount = config.scores.temporal_discount_factor.powi(depth_from_root as i32);
+            for score in &mut scores {
+                *score = (*score as f32 * discount) as i32;
             }
         }
 
@@ -2753,8 +2952,11 @@ impl Bot {
         }
 
         let our_head = board.snakes[our_idx].body[0];
-        let locality_threshold =
-            config.idapos.head_distance_multiplier * remaining_depth as i32;
+
+        // Calculate locality threshold with maximum cap
+        // Base threshold grows with depth, but cap prevents over-inclusion at high depths
+        let base_threshold = config.idapos.head_distance_multiplier * remaining_depth as i32;
+        let locality_threshold = std::cmp::min(base_threshold, config.idapos.max_locality_distance);
 
         for (idx, snake) in board.snakes.iter().enumerate() {
             if idx == our_idx || snake.health <= 0 {
@@ -2768,9 +2970,9 @@ impl Bot {
                 continue;
             }
 
-            // Check any body segment distance
+            // Check any body segment distance (using same capped threshold)
             for &segment in &snake.body {
-                if manhattan_distance(our_head, segment) <= remaining_depth as i32 {
+                if manhattan_distance(our_head, segment) <= locality_threshold {
                     active.push(idx);
                     break;
                 }
@@ -2809,6 +3011,7 @@ impl Bot {
         board: &Board,
         our_snake_id: &str,
         depth: u8,
+        depth_from_root: u8,
         our_idx: usize,
         opponent_idx: usize,
         config: &Config,
@@ -2833,6 +3036,7 @@ impl Bot {
             &simplified_board,
             our_snake_id,
             depth,
+            depth_from_root,
             i32::MIN,
             i32::MAX,
             true,
@@ -2857,6 +3061,7 @@ impl Bot {
         board: &Board,
         our_snake_id: &str,
         depth: u8,
+        depth_from_root: u8,
         current_player_idx: usize,
         config: &Config,
         tt: &Arc<TranspositionTable>,
@@ -2885,7 +3090,7 @@ impl Bot {
 
         // Check for terminal state first
         if Self::is_terminal(board, our_snake_id, config) {
-            let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes));
+            let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes), depth_from_root);
             tt.store(board_hash, eval.for_player(our_idx), depth, BoundType::Exact, None);
             return eval;
         }
@@ -2899,6 +3104,7 @@ impl Bot {
                     board,
                     our_snake_id,
                     1, // Extended depth
+                    depth_from_root + 1, // Going one ply deeper
                     current_player_idx,
                     config,
                     tt,
@@ -2908,7 +3114,7 @@ impl Bot {
             }
 
             // Stable position at depth 0, evaluate normally
-            let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes));
+            let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes), depth_from_root);
             tt.store(board_hash, eval.for_player(our_idx), depth, BoundType::Exact, None);
             return eval;
         }
@@ -2928,6 +3134,7 @@ impl Bot {
                 board,
                 our_snake_id,
                 depth,
+                depth_from_root,
                 our_idx,
                 opponent_idx,
                 config,
@@ -2949,10 +3156,10 @@ impl Bot {
                 // Advance game state and reduce depth
                 let mut advanced_board = board.clone();
                 Self::advance_game_state(&mut advanced_board);
-                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, our_idx, config, tt, killers, history);
+                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, depth_from_root + 1, our_idx, config, tt, killers, history);
             } else {
                 // Continue with next player at same depth
-                return Self::maxn_search(board, our_snake_id, depth, next, config, tt, killers, history);
+                return Self::maxn_search(board, our_snake_id, depth, depth_from_root, next, config, tt, killers, history);
             }
         }
 
@@ -2964,7 +3171,7 @@ impl Bot {
             let mut dead_board = board.clone();
             dead_board.snakes[current_player_idx].health = 0;
             let next = (current_player_idx + 1) % board.snakes.len();
-            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config, tt, killers, history);
+            return Self::maxn_search(&dead_board, our_snake_id, depth, depth_from_root, next, config, tt, killers, history);
         }
 
         // Try to get best move from transposition table for move ordering
@@ -2987,10 +3194,10 @@ impl Bot {
             let child_tuple = if all_moved {
                 // All snakes have moved - advance game state and reduce depth
                 Self::advance_game_state(&mut child_board);
-                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config, tt, killers, history)
+                Self::maxn_search(&child_board, our_snake_id, depth - 1, depth_from_root + 1, our_idx, config, tt, killers, history)
             } else {
                 // Continue with next player at same depth
-                Self::maxn_search(&child_board, our_snake_id, depth, next, config, tt, killers, history)
+                Self::maxn_search(&child_board, our_snake_id, depth, depth_from_root, next, config, tt, killers, history)
             };
 
             // Update if current player improves their score
@@ -3019,6 +3226,7 @@ impl Bot {
         board: &Board,
         our_snake_id: &str,
         depth: u8,
+        depth_from_root: u8,
         mut alpha: i32,
         mut beta: i32,
         is_max: bool,
@@ -3039,7 +3247,7 @@ impl Bot {
 
         // Check for terminal state first
         if Self::is_terminal(board, our_snake_id, config) {
-            let scores = Self::evaluate_state(board, our_snake_id, config, None);
+            let scores = Self::evaluate_state(board, our_snake_id, config, None, depth_from_root);
             let our_idx = board
                 .snakes
                 .iter()
@@ -3059,6 +3267,7 @@ impl Bot {
                     board,
                     our_snake_id,
                     1, // Extended depth
+                    depth_from_root + 1,  // Extending search, increment depth from root
                     alpha,
                     beta,
                     is_max,
@@ -3070,7 +3279,7 @@ impl Bot {
             }
 
             // Stable position at depth 0, evaluate normally
-            let scores = Self::evaluate_state(board, our_snake_id, config, None);
+            let scores = Self::evaluate_state(board, our_snake_id, config, None, depth_from_root);
             let our_idx = board
                 .snakes
                 .iter()
@@ -3103,7 +3312,7 @@ impl Bot {
 
         if player_idx >= board.snakes.len() || board.snakes[player_idx].health <= 0 {
             // Player is dead, return evaluation
-            let scores = Self::evaluate_state(board, our_snake_id, config, None);
+            let scores = Self::evaluate_state(board, our_snake_id, config, None, depth_from_root);
             return scores.for_player(our_idx);
         }
 
@@ -3116,6 +3325,7 @@ impl Bot {
                 &dead_board,
                 our_snake_id,
                 depth,
+                depth_from_root,  // Same depth, no state change
                 alpha,
                 beta,
                 !is_max,
@@ -3147,6 +3357,7 @@ impl Bot {
                     &child_board,
                     our_snake_id,
                     depth - 1,
+                    depth_from_root + 1,  // One ply deeper
                     alpha,
                     beta,
                     false,
@@ -3194,6 +3405,7 @@ impl Bot {
                     &child_board,
                     our_snake_id,
                     depth - 1,
+                    depth_from_root + 1,  // One ply deeper
                     alpha,
                     beta,
                     true,
@@ -3295,6 +3507,7 @@ impl Bot {
                 &child_board,
                 our_snake_id,
                 depth.saturating_sub(1),
+                1, // One ply down from root
                 our_idx,
                 config,
                 tt,
@@ -3379,6 +3592,7 @@ impl Bot {
                 &child_board,
                 our_snake_id,
                 depth.saturating_sub(1),
+                1,  // One ply down from root after applying move
                 i32::MIN,
                 i32::MAX,
                 false,
@@ -3429,7 +3643,7 @@ impl Bot {
         }
 
         // Compute individual score components
-        let health = Self::compute_health_score(&test_board, our_idx, config);
+        let health = Self::compute_health_score(&test_board, our_idx, &[], config);
         let space = Self::compute_space_score(&test_board, our_idx, &[], config);
         let control = Self::compute_control_score(&test_board, our_idx, config);
         let length = test_board.snakes[our_idx].length * config.scores.weight_length;
