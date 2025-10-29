@@ -1930,15 +1930,20 @@ impl Bot {
                     .min()
                     .unwrap_or(999);
 
-                // If we have 3+ move advantage, treat as attractive
-                if nearest_opponent_dist >= nearest_food_dist + 3 {
-                    config.scores.survival_max_multiplier * 0.3
+                // V9.1.2: Increased multipliers to reduce food aversion with clear advantage
+                // At low health (<50), always pursue distance-2 food aggressively
+                if snake.health < 50 {
+                    // Critical health: max multiplier for distance-2 food
+                    config.scores.survival_max_multiplier
+                } else if nearest_opponent_dist >= nearest_food_dist + 3 {
+                    // Clear 3+ move advantage: use high multiplier (was 0.3x, now 0.8x)
+                    config.scores.survival_max_multiplier * 0.8
                 } else {
-                    // Uncertain, damp heavily
-                    config.scores.survival_max_multiplier * 0.05
+                    // Contested: moderate multiplier (was 0.05x, now 0.2x)
+                    config.scores.survival_max_multiplier * 0.2
                 }
             } else {
-                // Distance 3+: Even more uncertain
+                // Distance 3+: More conservative, but still reward clear advantages
                 let nearest_opponent_dist = active_snakes.iter()
                     .filter_map(|&opp_idx| {
                         if opp_idx == snake_idx || opp_idx >= board.snakes.len() {
@@ -1953,11 +1958,19 @@ impl Bot {
                     .min()
                     .unwrap_or(999);
 
-                // Large advantage needed for distant food
-                if nearest_opponent_dist >= nearest_food_dist + 4 {
+                // V9.1.2: Increased multipliers for distant food with clear advantage
+                // At critical health (<30), pursue any nearby food
+                if snake.health < 30 && nearest_food_dist <= 4 {
+                    // Desperate: pursue distance 3-4 food at critical health
+                    config.scores.survival_max_multiplier * 0.5
+                } else if nearest_opponent_dist >= nearest_food_dist + 4 {
+                    // Clear 4+ move advantage: use moderate multiplier (was 0.1x, now 0.4x)
+                    config.scores.survival_max_multiplier * 0.4
+                } else if nearest_opponent_dist >= nearest_food_dist + 2 {
+                    // Small 2+ move advantage: use low multiplier
                     config.scores.survival_max_multiplier * 0.1
                 } else {
-                    // Very uncertain, minimal multiplier
+                    // Contested or no advantage: minimal multiplier
                     1.0
                 }
             };

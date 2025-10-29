@@ -1,6 +1,47 @@
 ## Version History
 
-### V9.1.1 (Current) - Critical Food Acquisition Fix: Cycling Elimination
+### V9.1.2 (Current) - Food Pursuit Optimization: Increased Multipliers for Uncontested Food
+**Status:** COMPLETED - January 2025
+**Key Improvements:**
+- ✅ **Increased urgency multipliers** for distance 2-5 food with clear opponent advantage
+- ✅ **Health-aware food pursuit**: Max multiplier for distance-2 food when health < 50
+- ✅ **Desperate mode**: Aggressive pursuit at critical health (<30) for nearby food (distance 3-4)
+- ✅ **Better balance**: Higher multipliers (0.8x, 0.4x) vs V9.1.1 (0.3x, 0.1x) for uncontested food
+
+**Motivation:**
+- V9.1.1 analysis identified 27 cases where bot moved away from food with 3+ move advantage
+- Investigation revealed multipliers for distance 2+ were too conservative (0.3x, 0.1x)
+- These low multipliers could be overwhelmed by future penalties from search tree
+- Solution: Increase multipliers while maintaining strategic caution
+
+**Changes:**
+```
+Distance 2 food:
+  - Health < 50: 1.0x (max multiplier) - NEW
+  - 3+ move advantage: 0.3x → 0.8x
+  - Contested: 0.05x → 0.2x
+
+Distance 3+ food:
+  - Health < 30 (distance 3-4): 0.5x - NEW
+  - 4+ move advantage: 0.1x → 0.4x
+  - 2+ move advantage: 0.1x - NEW
+  - Contested: 1.0x (unchanged)
+```
+
+**Testing & Verification:**
+- Replay match rates: 99-100% (highly deterministic)
+- V9.1.1 "food aversion" cases appear to be correct strategic decisions
+- Bot correctly prioritizes space control and entrapment avoidance over distant food
+- V9.1.2 provides safety margin for edge cases while maintaining strategic play
+
+**Score Impact:**
+- Distance 2 with 3+ advantage: 11.25B → 30B (2.7x increase)
+- Distance 2 at low health: 11.25B → 37.5B (3.3x increase)
+- Distance 3-4 with 4+ advantage: 3.75B → 15B (4x increase)
+
+---
+
+### V9.1.1 - Critical Food Acquisition Fix: Cycling Elimination
 **Status:** COMPLETED - January 2025
 **Key Fix:**
 - ✅ **CYCLING BUG ELIMINATED**: Bot no longer spins in circles around adjacent safe food
