@@ -244,7 +244,7 @@ impl Config {
             time_estimation: TimeEstimationConfig {
                 one_vs_one: GameModeTimeEstimation {
                     base_iteration_time_ms: 0.01,
-                    branching_factor: 3.25,  // Balanced: captures unused budget, minimizes timeouts
+                    branching_factor: 2.75,  // Tuned with move ordering: achieves depth 5.76 with 0% timeouts
                 },
                 multiplayer: GameModeTimeEstimation {
                     base_iteration_time_ms: 0.01,

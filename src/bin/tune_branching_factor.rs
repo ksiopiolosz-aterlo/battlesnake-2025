@@ -15,24 +15,33 @@ use std::path::Path;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 3 {
-        eprintln!("Usage: {} <log_directory> <target_timeout_rate_%>", args[0]);
-        eprintln!("Example: {} tests/fixtures/battle_royale_florence/ 10.0", args[0]);
+    if args.len() < 4 {
+        eprintln!("Usage: {} <log_directory> <target_timeout_rate_%> <mode>", args[0]);
+        eprintln!("  mode: '1v1' or 'multiplayer'");
+        eprintln!("Example: {} tests/fixtures/1v1_self/ 2.0 1v1", args[0]);
+        eprintln!("Example: {} tests/fixtures/battle_royale_florence/ 10.0 multiplayer", args[0]);
         std::process::exit(1);
     }
 
     let log_dir = Path::new(&args[1]);
     let target_timeout_rate: f64 = args[2].parse()
         .expect("Target timeout rate must be a number");
+    let mode = args[3].as_str();
 
     if !log_dir.is_dir() {
         eprintln!("Error: {} is not a directory", log_dir.display());
         std::process::exit(1);
     }
 
+    if mode != "1v1" && mode != "multiplayer" {
+        eprintln!("Error: mode must be '1v1' or 'multiplayer', got: {}", mode);
+        std::process::exit(1);
+    }
+
     println!("\n═══════════════════════════════════════════════════════════");
     println!("        BRANCHING FACTOR OPTIMIZATION TOOL");
     println!("═══════════════════════════════════════════════════════════");
+    println!("Mode:                {}", mode);
     println!("Log Directory:       {}", log_dir.display());
     println!("Target Timeout Rate: {:.1}%", target_timeout_rate);
     println!("═══════════════════════════════════════════════════════════\n");
@@ -62,7 +71,7 @@ fn main() {
         println!("Iteration {}: Testing branching_factor = {:.2}", iterations, mid);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-        let result = test_branching_factor(&log_files, mid);
+        let result = test_branching_factor(&log_files, mid, mode);
 
         println!("  Average Depth:    {:.2}", result.avg_depth);
         println!("  Timeout Rate:     {:.1}% ({}/{})", result.timeout_rate, result.timeouts, result.total_turns);
@@ -98,7 +107,11 @@ fn main() {
 
     println!("Recommended Snake.toml update:");
     println!("```toml");
-    println!("[time_estimation.multiplayer]");
+    if mode == "1v1" {
+        println!("[time_estimation.one_vs_one]");
+    } else {
+        println!("[time_estimation.multiplayer]");
+    }
     println!("branching_factor = {:.2}", best_factor);
     println!("```\n");
 }
@@ -112,11 +125,15 @@ struct TestResult {
     avg_time: u128,
 }
 
-fn test_branching_factor(log_files: &[std::path::PathBuf], branching_factor: f64) -> TestResult {
+fn test_branching_factor(log_files: &[std::path::PathBuf], branching_factor: f64, mode: &str) -> TestResult {
     let mut config = Config::load_or_default();
 
-    // Override branching factor
-    config.time_estimation.multiplayer.branching_factor = branching_factor;
+    // Override branching factor based on mode
+    if mode == "1v1" {
+        config.time_estimation.one_vs_one.branching_factor = branching_factor;
+    } else {
+        config.time_estimation.multiplayer.branching_factor = branching_factor;
+    }
 
     let engine = ReplayEngine::new(config.clone(), false);
 
