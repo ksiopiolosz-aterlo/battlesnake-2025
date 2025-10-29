@@ -1389,7 +1389,17 @@ impl Bot {
     /// Flood fill BFS to count reachable cells from a starting position
     /// Accounts for snake bodies that will move over time
     /// Returns the number of cells reachable
-    fn flood_fill_bfs(board: &Board, start: Coord, _snake_idx: usize) -> usize {
+    ///
+    /// # Performance Optimization
+    /// If `early_exit_threshold` is provided, the search terminates early once
+    /// that many cells are found. This is useful when we only need to know if
+    /// "enough" space exists (e.g., checking if opponent is trapped).
+    fn flood_fill_bfs(
+        board: &Board,
+        start: Coord,
+        _snake_idx: usize,
+        early_exit_threshold: Option<usize>,
+    ) -> usize {
         let _prof = simple_profiler::ProfileGuard::new("flood_fill");
 
         // Pre-build obstacle map for O(1) lookups (huge performance improvement)
@@ -1412,6 +1422,13 @@ impl Bot {
         visited.insert(start);
 
         while let Some((pos, turns)) = queue.pop_front() {
+            // Early exit optimization: if we've found enough space, stop searching
+            if let Some(threshold) = early_exit_threshold {
+                if visited.len() >= threshold {
+                    return visited.len();
+                }
+            }
+
             for dir in Direction::all().iter() {
                 let next = dir.apply(&pos);
 
@@ -1909,11 +1926,15 @@ impl Bot {
             }
 
             // Trap potential - opponent has limited space (use cache if available)
+            // Early exit threshold: if opponent has enough space, we don't need exact count
+            let trap_threshold = opponent.length as usize + config.scores.attack_trap_margin;
             let opp_space = space_cache
                 .get(&idx)
                 .copied()
-                .unwrap_or_else(|| Self::flood_fill_bfs(board, opponent.body[0], idx));
-            if opp_space < opponent.length as usize + config.scores.attack_trap_margin {
+                .unwrap_or_else(|| {
+                    Self::flood_fill_bfs(board, opponent.body[0], idx, Some(trap_threshold + 1))
+                });
+            if opp_space < trap_threshold {
                 attack += config.scores.attack_trap_bonus;
             }
         }
@@ -2041,7 +2062,8 @@ impl Bot {
                 // Only compute for active snakes (IDAPOS optimization)
                 let is_active = active_snakes.map_or(true, |active| active.contains(&idx));
                 if is_active {
-                    space_cache.insert(idx, Self::flood_fill_bfs(board, snake.body[0], idx));
+                    // No early exit threshold - cache needs exact count for multiple components
+                    space_cache.insert(idx, Self::flood_fill_bfs(board, snake.body[0], idx, None));
                 }
             }
         }
