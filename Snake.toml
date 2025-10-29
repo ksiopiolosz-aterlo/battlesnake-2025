@@ -17,6 +17,12 @@ initial_depth = 2
 min_time_remaining_ms = 20
 # Safety cap for maximum search depth
 max_search_depth = 20
+# Score threshold for certain win (stop searching if achieved)
+certain_win_threshold = 1000000
+# Score threshold for certain loss (stop searching to save time)
+certain_loss_threshold = -1000000
+# Number of iterations without score improvement before considering early exit
+no_improvement_tolerance = 2
 
 # ============================================================================
 # Move Ordering Constants
@@ -348,7 +354,7 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "optimized_v8.1.jsonl"
+log_file_path = "optimized_v9.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration

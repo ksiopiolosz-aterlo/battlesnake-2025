@@ -1,6 +1,49 @@
 ## Version History
 
-### V8.1 (Current) - Critical Food Acquisition Fix
+### V9 (Current) - Time Management & Search Efficiency
+**Status:** COMPLETED - January 2025
+**Key Features:**
+- ✅ **Time Management with Early Exit**: Stop searching when outcome is decided or no improvement
+- ✅ **Certain Win Detection**: Exit search at depth N if score ≥ 1M (certain win threshold)
+- ✅ **Certain Loss Detection**: Exit search at depth N if score ≤ -1M (forced loss threshold)
+- ✅ **No Improvement Tracking**: Exit early if score hasn't improved for 2+ iterations with <33% time remaining
+- ✅ **Builds on V8.2**: Retains food acquisition fix and all previous improvements
+
+**Implementation Details:**
+- Added tracking variables: `previous_best_score`, `depth_since_improvement` (src/bot.rs:914-915)
+- Added three early exit conditions after each depth completes (src/bot.rs:1061-1082)
+- New configuration parameters:
+  - `certain_win_threshold = 1000000` (Snake.toml:21)
+  - `certain_loss_threshold = -1000000` (Snake.toml:23)
+  - `no_improvement_tolerance = 2` (Snake.toml:25)
+
+**Expected Impact:**
+- Save 10-20% computation time in decided positions
+- Enable deeper search in competitive games by conserving time
+- Reduce wasted iterations when position is clearly won/lost
+
+**Performance Characteristics:**
+- Early exit triggers when: (1) certain win, (2) forced loss, (3) no score improvement for 2+ depths with low time
+- Preserves anytime property: always has a valid move from previous iteration
+- Depth tracking resets when score improves, continues search while making progress
+
+---
+
+### V8.2 - Escape Route Bug Fix
+**Status:** COMPLETED - January 2025
+**Key Fix:**
+- ✅ Fixed spurious escape route penalty when `just_ate_food=true`
+- ✅ V8.1 issue: escape route check used wrong food position (the one we just ate was gone!)
+- ✅ Solution: Skip escape route check entirely when `just_ate_food` (src/bot.rs:1892)
+
+**Root Cause:**
+- When evaluating states where we just ate food (health==100), the food we ate is removed from board
+- Looking up "nearest food" finds a DIFFERENT food, applying penalties for wrong position
+- Escape route penalty (-1500) cancelled out the +375M food bonus, causing cycling behavior
+
+---
+
+### V8.1 - Critical Food Acquisition Fix
 **Status:** COMPLETED - January 2025
 **Key Fix:**
 - ✅ **CRITICAL BUG FIX**: immediate_food_bonus now triggers when food is EATEN, not just when adjacent

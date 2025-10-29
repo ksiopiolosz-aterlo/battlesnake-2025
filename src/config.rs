@@ -32,6 +32,9 @@ pub struct TimingConfig {
     pub initial_depth: u8,
     pub min_time_remaining_ms: u64,
     pub max_search_depth: u8,
+    pub certain_win_threshold: i32,
+    pub certain_loss_threshold: i32,
+    pub no_improvement_tolerance: u8,
 }
 
 impl TimingConfig {
@@ -290,6 +293,9 @@ impl Config {
                 initial_depth: 2,
                 min_time_remaining_ms: 20,
                 max_search_depth: 20,
+                certain_win_threshold: 1000000,
+                certain_loss_threshold: -1000000,
+                no_improvement_tolerance: 2,
             },
             time_estimation: TimeEstimationConfig {
                 model_weight: 0.1,  // Reduced from 0.4 - favor empirical observations

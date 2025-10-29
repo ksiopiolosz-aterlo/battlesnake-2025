@@ -910,6 +910,10 @@ impl Bot {
         let effective_budget = config.timing.effective_budget_ms();
         let mut previous_score: Option<i32> = None;  // Track previous iteration score for aspiration windows
 
+        // V9: Track score improvement for early exit
+        let mut previous_best_score: Option<i32> = None;
+        let mut depth_since_improvement: u8 = 0;
+
         loop {
             let elapsed = start_time.elapsed().as_millis() as u64;
             let remaining = effective_budget.saturating_sub(elapsed);
@@ -1053,6 +1057,39 @@ impl Bot {
                 "Completed depth {} in {}ms (estimated: {}ms, diff: {}ms)",
                 current_depth, iteration_elapsed, estimated_time, iteration_elapsed as i64 - estimated_time as i64
             );
+
+            // V9: Early exit conditions for decided positions
+            // Early exit condition 1: Certain win
+            if best_score >= config.timing.certain_win_threshold {
+                info!("Certain win detected (score: {}), stopping search at depth {}",
+                      best_score, current_depth);
+                break;
+            }
+
+            // Early exit condition 2: Forced loss
+            if best_score <= config.timing.certain_loss_threshold {
+                info!("Forced loss detected (score: {}), stopping search at depth {}",
+                      best_score, current_depth);
+                break;
+            }
+
+            // Early exit condition 3: No improvement in last N iterations with low time remaining
+            if depth_since_improvement >= config.timing.no_improvement_tolerance
+                && remaining < effective_budget / 3 {
+                info!("No score improvement for {} iterations, conserving time at depth {}",
+                      depth_since_improvement, current_depth);
+                break;
+            }
+
+            // Track improvement for next iteration
+            if let Some(prev_score) = previous_best_score {
+                if best_score > prev_score {
+                    depth_since_improvement = 0;
+                } else {
+                    depth_since_improvement += 1;
+                }
+            }
+            previous_best_score = Some(best_score);
 
             current_depth += 1;
         }
@@ -1888,7 +1925,9 @@ impl Bot {
             };
 
             // Check escape routes after eating this food
-            if let Some(food_pos) = nearest_food {
+            // V8.1 FIX: Skip escape route check when just_ate_food, since nearest_food is wrong food
+            if !just_ate_food {
+              if let Some(food_pos) = nearest_food {
                 let escape_routes = Self::count_escape_routes_after_eating(board, snake_idx, food_pos);
 
                 // If we'd have insufficient escape routes after eating, penalize
@@ -1919,6 +1958,7 @@ impl Bot {
                     let base_bonus = config.scores.immediate_food_bonus + penalty + safe_food_bonus;
                     return (base_bonus as f32 * urgency_multiplier) as i32;
                 }
+              }
             }
 
             // No escape route penalty - just apply urgency multiplier to base bonus
