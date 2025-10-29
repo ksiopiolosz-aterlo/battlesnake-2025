@@ -14,6 +14,7 @@ pub struct Config {
     pub scores: ScoresConfig,
     pub idapos: IdaposConfig,
     pub move_ordering: MoveOrderingConfig,
+    pub aspiration_windows: AspirationWindowsConfig,
     pub move_generation: MoveGenerationConfig,
     pub player_indices: PlayerIndicesConfig,
     pub direction_encoding: DirectionEncodingConfig,
@@ -156,6 +157,14 @@ pub struct MoveOrderingConfig {
     pub killer_moves_per_depth: usize,
     pub enable_pv_ordering: bool,
     pub enable_killer_heuristic: bool,
+}
+
+/// Aspiration windows constants for 1v1 alpha-beta search
+#[derive(Debug, Deserialize, Clone)]
+pub struct AspirationWindowsConfig {
+    pub enabled: bool,
+    pub initial_window_size: i32,
+    pub window_expansion_multiplier: i32,
 }
 
 /// Move generation constants
@@ -305,6 +314,11 @@ impl Config {
                 killer_moves_per_depth: 2,
                 enable_pv_ordering: true,
                 enable_killer_heuristic: true,
+            },
+            aspiration_windows: AspirationWindowsConfig {
+                enabled: true,
+                initial_window_size: 50,
+                window_expansion_multiplier: 3,
             },
             move_generation: MoveGenerationConfig {
                 snake_min_body_length_for_neck: 1,

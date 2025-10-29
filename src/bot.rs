@@ -45,6 +45,18 @@ impl ScoreTuple {
     }
 }
 
+/// Bound type for transposition table entries
+/// Used for alpha-beta pruning optimization
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BoundType {
+    /// Exact score (PV node)
+    Exact,
+    /// Lower bound (beta cutoff, actual score >= stored score)
+    Lower,
+    /// Upper bound (alpha cutoff, actual score <= stored score)
+    Upper,
+}
+
 /// Entry in the transposition table
 #[derive(Debug, Clone)]
 struct TranspositionEntry {
@@ -52,6 +64,10 @@ struct TranspositionEntry {
     score: i32,
     /// Depth at which this state was evaluated
     depth: u8,
+    /// Type of bound stored (exact, lower, or upper)
+    bound_type: BoundType,
+    /// Best move found at this position (for move ordering)
+    best_move: Option<Direction>,
     /// Age for LRU eviction (generation number)
     age: u32,
 }
@@ -125,9 +141,23 @@ impl TranspositionTable {
         None
     }
 
+    /// Probes the transposition table and returns both score and best move
+    pub fn probe_with_move(&self, board_hash: u64, required_depth: u8) -> Option<(i32, Option<Direction>)> {
+        let table = self.table.read().ok()?;
+
+        if let Some(entry) = table.get(&board_hash) {
+            // Only use cached value if it was searched to at least the required depth
+            if entry.depth >= required_depth {
+                return Some((entry.score, entry.best_move));
+            }
+        }
+
+        None
+    }
+
     /// Stores an evaluation in the transposition table
     /// Performs LRU eviction if table is full
-    pub fn store(&self, board_hash: u64, score: i32, depth: u8) {
+    pub fn store(&self, board_hash: u64, score: i32, depth: u8, bound_type: BoundType, best_move: Option<Direction>) {
         let current_age = self.current_age.load(Ordering::Relaxed);
 
         if let Ok(mut table) = self.table.write() {
@@ -154,6 +184,8 @@ impl TranspositionTable {
                     // Update if new depth is deeper
                     entry.score = score;
                     entry.depth = depth;
+                    entry.bound_type = bound_type;
+                    entry.best_move = best_move;
                     entry.age = current_age;
                 }
                 None => {
@@ -161,6 +193,8 @@ impl TranspositionTable {
                     table.insert(board_hash, TranspositionEntry {
                         score,
                         depth,
+                        bound_type,
+                        best_move,
                         age: current_age,
                     });
                 }
@@ -754,6 +788,7 @@ impl Bot {
         // Iterative deepening loop
         let mut current_depth = config.timing.initial_depth;
         let effective_budget = config.timing.effective_budget_ms();
+        let mut previous_score: Option<i32> = None;  // Track previous iteration score for aspiration windows
 
         loop {
             let elapsed = start_time.elapsed().as_millis() as u64;
@@ -823,10 +858,58 @@ impl Bot {
             // Record iteration start time
             let iteration_start = Instant::now();
 
+            // Determine if we should use aspiration windows
+            let use_aspiration_windows = config.aspiration_windows.enabled
+                && strategy == ExecutionStrategy::Sequential
+                && num_alive_snakes == config.strategy.min_snakes_for_1v1
+                && previous_score.is_some();
+
             // Execute search with strategy-specific parameters
             match strategy {
                 ExecutionStrategy::Sequential => {
-                    Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move);
+                    if use_aspiration_windows {
+                        let prev_score = previous_score.unwrap();
+                        let window_size = config.aspiration_windows.initial_window_size;
+                        let mut alpha = prev_score.saturating_sub(window_size);
+                        let mut beta = prev_score.saturating_add(window_size);
+
+                        info!("Using aspiration window: [{}, {}] (previous score: {})", alpha, beta, prev_score);
+
+                        // First search with narrow window
+                        Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
+
+                        // Check if we failed outside the window
+                        let (_, result_score) = shared.get_best();
+
+                        if result_score <= alpha {
+                            // Fail-low: re-search with lower bound at -∞
+                            info!("Aspiration window fail-low ({} <= {}), re-searching with wider window", result_score, alpha);
+                            alpha = i32::MIN;
+                            Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
+
+                            let (_, retry_score) = shared.get_best();
+                            if retry_score >= beta {
+                                // Also failed high on retry, do full window search
+                                info!("Retry also failed high ({} >= {}), searching with full window", retry_score, beta);
+                                Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
+                            }
+                        } else if result_score >= beta {
+                            // Fail-high: re-search with upper bound at +∞
+                            info!("Aspiration window fail-high ({} >= {}), re-searching with wider window", result_score, beta);
+                            beta = i32::MAX;
+                            Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
+
+                            let (_, retry_score) = shared.get_best();
+                            if retry_score <= alpha {
+                                // Also failed low on retry, do full window search
+                                info!("Retry also failed low ({} <= {}), searching with full window", retry_score, alpha);
+                                Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
+                            }
+                        }
+                    } else {
+                        // No aspiration windows, use full window
+                        Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
+                    }
                 }
                 ExecutionStrategy::Parallel1v1 => {
                     Self::parallel_1v1_search(board, you, current_depth, &shared, config, &tt, &mut history, pv_move);
@@ -839,9 +922,10 @@ impl Bot {
             // Record actual iteration time
             let iteration_elapsed = iteration_start.elapsed().as_millis() as u64;
 
-            // Extract best move from this iteration to use as PV move for next iteration
-            let (best_move_idx, _) = shared.get_best();
+            // Extract best move and score from this iteration
+            let (best_move_idx, best_score) = shared.get_best();
             pv_move = Some(Self::index_to_direction(best_move_idx, config));
+            previous_score = Some(best_score);  // Store for next iteration's aspiration window
 
             info!(
                 "Completed depth {} in {}ms (estimated: {}ms, diff: {}ms)",
@@ -901,6 +985,8 @@ impl Bot {
         killers: &mut KillerMoveTable,
         history: &mut HistoryTable,
         pv_move: Option<Direction>,
+        alpha: i32,
+        beta: i32,
     ) {
         // Generate legal moves for our snake
         let mut legal_moves = Self::generate_legal_moves(board, you, config);
@@ -949,13 +1035,13 @@ impl Bot {
             Self::apply_move(&mut child_board, our_idx, mv, config);
 
             let score = if use_alpha_beta {
-                // Use alpha-beta for 1v1
+                // Use alpha-beta for 1v1 with aspiration window
                 Self::alpha_beta_minimax(
                     &child_board,
                     our_snake_id,
                     depth.saturating_sub(1),
-                    i32::MIN,
-                    i32::MAX,
+                    alpha,
+                    beta,
                     false,
                     config,
                     tt,
@@ -2207,7 +2293,7 @@ impl Bot {
         // Check for terminal state first
         if Self::is_terminal(board, our_snake_id, config) {
             let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes));
-            tt.store(board_hash, eval.for_player(our_idx), depth);
+            tt.store(board_hash, eval.for_player(our_idx), depth, BoundType::Exact, None);
             return eval;
         }
 
@@ -2230,7 +2316,7 @@ impl Bot {
 
             // Stable position at depth 0, evaluate normally
             let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes));
-            tt.store(board_hash, eval.for_player(our_idx), depth);
+            tt.store(board_hash, eval.for_player(our_idx), depth, BoundType::Exact, None);
             return eval;
         }
 
@@ -2288,9 +2374,12 @@ impl Bot {
             return Self::maxn_search(&dead_board, our_snake_id, depth, next, config, tt, killers, history);
         }
 
-        // Order moves using history heuristic for better move ordering
+        // Try to get best move from transposition table for move ordering
+        let tt_best_move = tt.probe_with_move(board_hash, depth).and_then(|(_, mv)| mv);
+
+        // Order moves using TT move > killers > history heuristic
         let current_pos = &board.snakes[current_player_idx].body[0];
-        moves = order_moves(moves, None, killers, Some((history, current_pos)), depth, config);
+        moves = order_moves(moves, tt_best_move, killers, Some((history, current_pos)), depth, config);
 
         let mut best_tuple =
             ScoreTuple::new_with_value(board.snakes.len(), i32::MIN);
@@ -2327,7 +2416,7 @@ impl Bot {
         }
 
         // Store result in transposition table before returning
-        tt.store(board_hash, best_tuple.for_player(our_idx), depth);
+        tt.store(board_hash, best_tuple.for_player(our_idx), depth, BoundType::Exact, None);
         best_tuple
     }
 
@@ -2364,7 +2453,7 @@ impl Bot {
                 .position(|s| &s.id == our_snake_id)
                 .unwrap_or(0);
             let score = scores.for_player(our_idx);
-            tt.store(board_hash, score, depth);
+            tt.store(board_hash, score, depth, BoundType::Exact, None);
             return score;
         }
 
@@ -2395,7 +2484,7 @@ impl Bot {
                 .position(|s| &s.id == our_snake_id)
                 .unwrap_or(0);
             let score = scores.for_player(our_idx);
-            tt.store(board_hash, score, depth);
+            tt.store(board_hash, score, depth, BoundType::Exact, None);
             return score;
         }
 
@@ -2444,13 +2533,18 @@ impl Bot {
             );
         }
 
-        // Order moves for better alpha-beta pruning
-        // Use history heuristic for move ordering (no PV at interior nodes)
+        // Try to get best move from transposition table for move ordering
+        let tt_best_move = tt.probe_with_move(board_hash, depth).and_then(|(_, mv)| mv);
+
+        // Order moves using TT move > killers > history heuristic
         let current_pos = &board.snakes[player_idx].body[0];
-        moves = order_moves(moves, None, killers, Some((history, current_pos)), depth, config);
+        moves = order_moves(moves, tt_best_move, killers, Some((history, current_pos)), depth, config);
 
         if is_max {
             let mut max_eval = i32::MIN;
+            let mut best_move: Option<Direction> = None;
+            let mut had_cutoff = false;
+
             for mv in moves {
                 let mut child_board = board.clone();
                 Self::apply_move(&mut child_board, player_idx, mv, config);
@@ -2468,20 +2562,36 @@ impl Bot {
                     killers,
                     history,
                 );
-                max_eval = max_eval.max(eval);
+
+                if eval > max_eval {
+                    max_eval = eval;
+                    best_move = Some(mv);
+                }
+
                 alpha = alpha.max(eval);
                 if beta <= alpha {
                     // Beta cutoff: record this move as a killer and update history
                     killers.record_killer(depth, mv, config);
                     history.update(current_pos, mv, depth, true);
                     simple_profiler::record_alpha_beta_cutoff();
+                    had_cutoff = true;
                     break;
                 }
             }
-            tt.store(board_hash, max_eval, depth);
+
+            // Store with appropriate bound type
+            let bound_type = if had_cutoff {
+                BoundType::Lower  // Beta cutoff: actual score >= max_eval
+            } else {
+                BoundType::Exact  // All moves explored: exact score
+            };
+            tt.store(board_hash, max_eval, depth, bound_type, best_move);
             max_eval
         } else {
             let mut min_eval = i32::MAX;
+            let mut best_move: Option<Direction> = None;
+            let mut had_cutoff = false;
+
             for mv in moves {
                 let mut child_board = board.clone();
                 Self::apply_move(&mut child_board, player_idx, mv, config);
@@ -2499,17 +2609,30 @@ impl Bot {
                     killers,
                     history,
                 );
-                min_eval = min_eval.min(eval);
+
+                if eval < min_eval {
+                    min_eval = eval;
+                    best_move = Some(mv);
+                }
+
                 beta = beta.min(eval);
                 if beta <= alpha {
                     // Alpha cutoff: record this move as a killer and update history
                     killers.record_killer(depth, mv, config);
                     history.update(current_pos, mv, depth, true);
                     simple_profiler::record_alpha_beta_cutoff();
+                    had_cutoff = true;
                     break;
                 }
             }
-            tt.store(board_hash, min_eval, depth);
+
+            // Store with appropriate bound type
+            let bound_type = if had_cutoff {
+                BoundType::Upper  // Alpha cutoff: actual score <= min_eval
+            } else {
+                BoundType::Exact  // All moves explored: exact score
+            };
+            tt.store(board_hash, min_eval, depth, bound_type, best_move);
             min_eval
         }
     }

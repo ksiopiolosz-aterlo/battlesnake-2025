@@ -30,6 +30,17 @@ enable_pv_ordering = true
 enable_killer_heuristic = true
 
 # ============================================================================
+# Aspiration Windows Constants
+# ============================================================================
+[aspiration_windows]
+# Enable aspiration windows for 1v1 scenarios (narrows alpha-beta window)
+enabled = true
+# Initial window size around previous iteration's score (e.g., ±50)
+initial_window_size = 50
+# Window expansion multiplier when re-searching after fail-high/fail-low
+window_expansion_multiplier = 3
+
+# ============================================================================
 # Time Estimation Constants
 # ============================================================================
 # Separate parameters for 1v1 and multiplayer (battle royale) scenarios
