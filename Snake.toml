@@ -1,5 +1,21 @@
-# Battlesnake Configuration File - V11
+# Battlesnake Configuration File - V11.3
 # All tunable parameters for the MaxN algorithm implementation
+#
+# V11.3 Changes (Performance Fix):
+# - Fixed timeout regression: V11.2 caused 228 timeouts in 2 self-play games
+# - Implemented turn-adaptive IDAPOS strategy:
+#   * Early game (turn < 30): multiplier=2, max_distance=8 (wider opponent awareness)
+#   * Late game (turn >= 30): multiplier=1, max_distance=5 (aggressive pruning for performance)
+# - Balances early-game awareness (prevents entrapment) vs late-game performance (prevents timeouts)
+# - Root cause: V11.2's uniform aggressive IDAPOS caused exponential branching factor increase
+#
+# V11.2 Changes (Post-Tournament Fixes):
+# - Fixed cycling bug: Added pre-search immediate food grabbing for distance-1 food
+# - Fixed corner traps: Added wall-distance tie-breaker in move selection (threshold: 1000 points)
+# - Fixed IDAPOS over-filtering: Increased head_distance_multiplier from 1 to 2
+# - Fixed IDAPOS over-filtering: Increased max_locality_distance from 5 to 8
+# - Improved early-game opponent awareness to prevent late-game entrapment
+# - Increased immediate_food_bonus from 75K to 100K for stronger adjacent food priority
 #
 # V11 Changes:
 # - Reduced immediate_food_bonus from 500K to 15K (33x reduction)
@@ -314,16 +330,21 @@ articulation_point_enabled = true       # Enable/disable articulation point dete
 # IDAPOS (Locality Masking) Constants
 # ============================================================================
 [idapos]
-# Multiplier for head-to-head distance check
-# Reduced from 2 to 1 for more aggressive locality masking
-# At depth 3: considers snakes within distance 3 (was 6)
-# This reduces branching factor significantly in battle royale
-head_distance_multiplier = 1
-# Maximum locality distance cap (prevents over-inclusion at high depths)
-# At depth 10 with multiplier 1, we'd consider distance 10 (entire 11x11 board!)
-# Cap at 5 ensures we only consider threats within 5 moves regardless of depth
-# This maintains IDAPOS effectiveness even when achieving depth 8-10
-max_locality_distance = 5
+# V11.3 FIX: Turn-adaptive IDAPOS strategy to balance awareness vs performance
+# Problem: V11.2 caused 228 timeouts in 2 self-play games due to over-inclusive filtering
+# Solution: Aggressive filtering in early game (awareness), conservative in late game (performance)
+
+# EARLY GAME SETTINGS (turn < early_game_turn_threshold)
+# Used when opponents are far apart and we need to avoid long-term entrapment
+early_game_head_distance_multiplier = 2   # Wider awareness
+early_game_max_locality_distance = 8      # Consider distant snakes
+early_game_turn_threshold = 30            # Turns considered "early game"
+
+# LATE GAME SETTINGS (turn >= early_game_turn_threshold)
+# Used when snakes are closer and performance is critical
+late_game_head_distance_multiplier = 1    # Conservative filtering
+late_game_max_locality_distance = 5       # Aggressive pruning
+
 # Min snakes in locality to switch to alpha-beta
 min_snakes_for_alpha_beta = 2
 

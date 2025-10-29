@@ -101,6 +101,7 @@ impl ReplayEngine {
         &self,
         board: &Board,
         our_snake_id: &str,
+        turn: i32,
     ) -> Result<(Direction, i32, u8, u128), String> {
         // Find our snake in the board
         let our_snake = board
@@ -132,10 +133,12 @@ impl ReplayEngine {
         let config_clone = self.config.clone();
 
         // Run computation synchronously (we're already in a non-async context)
+        let turn_clone = turn;
         std::thread::spawn(move || {
             Bot::compute_best_move_internal(
                 &board_clone,
                 &our_snake_clone,
+                turn_clone,
                 shared_clone,
                 start_time,
                 &config_clone,
@@ -180,7 +183,7 @@ impl ReplayEngine {
         let original_move = Self::parse_direction(&entry.chosen_move)?;
 
         let (replayed_move, replayed_score, search_depth, computation_time) =
-            self.replay_turn(&entry.board, &our_snake.id)?;
+            self.replay_turn(&entry.board, &our_snake.id, entry.turn)?;
 
         let matches = original_move == replayed_move;
 

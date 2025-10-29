@@ -828,10 +828,11 @@ impl Bot {
         let board_clone = board.clone();
         let you = you.clone();
         let config = self.config.clone();
+        let turn_number = *turn;
 
         // Spawn CPU-bound computation on rayon thread pool
         tokio::task::spawn_blocking(move || {
-            Bot::compute_best_move_internal(&board_clone, &you, shared_clone, start_time, &config)
+            Bot::compute_best_move_internal(&board_clone, &you, turn_number, shared_clone, start_time, &config)
         });
 
         // Polling loop: check for results or timeout
@@ -887,6 +888,7 @@ impl Bot {
     pub fn compute_best_move_internal(
         board: &Board,
         you: &Battlesnake,
+        turn: i32,
         shared: Arc<SharedSearchState>,
         start_time: Instant,
         config: &Config,
@@ -934,6 +936,17 @@ impl Bot {
             eprintln!("[PROFILE] Initialization: {}µs", init_elapsed);
         }
 
+        // PRE-SEARCH OPTIMIZATION: Immediate food grabbing
+        // If food is distance-1 (adjacent) and safe, grab it immediately without search
+        // This fixes the cycling bug where the bot circles around adjacent food
+        if let Some((food_move, food_pos)) = Self::find_immediate_safe_food(board, you, turn, config) {
+            info!("Found safe adjacent food at {:?}, taking immediate move: {}", food_pos, food_move.as_str());
+            let food_move_idx = Self::direction_to_index(food_move, config);
+            shared.force_initialize(food_move_idx, i32::MAX - 1000); // High score for immediate food
+            shared.search_complete.store(true, Ordering::Release);
+            return; // Skip search entirely
+        }
+
         // Iterative deepening loop
         let mut current_depth = config.timing.initial_depth;
         let effective_budget = config.timing.effective_budget_ms();
@@ -967,7 +980,7 @@ impl Bot {
 
             // CRITICAL FIX: Use IDAPOS-filtered snake count for time estimation
             // Previously used num_alive_snakes (all snakes), causing massive overestimation
-            let active_snakes = Self::determine_active_snakes(board, &you.id, current_depth, config);
+            let active_snakes = Self::determine_active_snakes(board, &you.id, turn, current_depth, config);
             let num_active_snakes = active_snakes.len();
 
             // Estimate time for next iteration using ADAPTIVE estimation
@@ -1029,7 +1042,7 @@ impl Bot {
                         info!("Using aspiration window: [{}, {}] (previous score: {})", alpha, beta, prev_score);
 
                         // First search with narrow window
-                        Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
+                        Self::sequential_search(board, you, turn, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
 
                         // Check if we failed outside the window
                         let (_, result_score) = shared.get_best();
@@ -1038,37 +1051,37 @@ impl Bot {
                             // Fail-low: re-search with lower bound at -∞
                             info!("Aspiration window fail-low ({} <= {}), re-searching with wider window", result_score, alpha);
                             alpha = i32::MIN;
-                            Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
+                            Self::sequential_search(board, you, turn, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
 
                             let (_, retry_score) = shared.get_best();
                             if retry_score >= beta {
                                 // Also failed high on retry, do full window search
                                 info!("Retry also failed high ({} >= {}), searching with full window", retry_score, beta);
-                                Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
+                                Self::sequential_search(board, you, turn, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
                             }
                         } else if result_score >= beta {
                             // Fail-high: re-search with upper bound at +∞
                             info!("Aspiration window fail-high ({} >= {}), re-searching with wider window", result_score, beta);
                             beta = i32::MAX;
-                            Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
+                            Self::sequential_search(board, you, turn, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, alpha, beta);
 
                             let (_, retry_score) = shared.get_best();
                             if retry_score <= alpha {
                                 // Also failed low on retry, do full window search
                                 info!("Retry also failed low ({} <= {}), searching with full window", retry_score, alpha);
-                                Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
+                                Self::sequential_search(board, you, turn, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
                             }
                         }
                     } else {
                         // No aspiration windows, use full window
-                        Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
+                        Self::sequential_search(board, you, turn, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move, i32::MIN, i32::MAX);
                     }
                 }
                 ExecutionStrategy::Parallel1v1 => {
                     Self::parallel_1v1_search(board, you, current_depth, &shared, config, &tt, &mut history, pv_move);
                 }
                 ExecutionStrategy::ParallelMultiplayer => {
-                    Self::parallel_multiplayer_search(board, you, current_depth, &shared, config, &tt, &mut history, pv_move);
+                    Self::parallel_multiplayer_search(board, you, turn, current_depth, &shared, config, &tt, &mut history, pv_move);
                 }
             }
 
@@ -1168,6 +1181,7 @@ impl Bot {
     fn sequential_search(
         board: &Board,
         you: &Battlesnake,
+        turn: i32,
         depth: u8,
         shared: &Arc<SharedSearchState>,
         config: &Config,
@@ -1219,6 +1233,7 @@ impl Bot {
             .unwrap_or(0);
 
         let mut best_score = i32::MIN;
+        let mut best_wall_distance = i32::MIN; // Track wall distance of best move
 
         for &mv in legal_moves.iter() {
             let mut child_board = board.clone();
@@ -1244,6 +1259,7 @@ impl Bot {
                 let tuple = Self::maxn_search(
                     &child_board,
                     our_snake_id,
+                    turn,
                     depth.saturating_sub(1),
                     1, // One ply down from root
                     our_idx,
@@ -1255,8 +1271,28 @@ impl Bot {
                 tuple.for_player(our_idx)
             };
 
-            if score > best_score {
+            // Calculate wall distance for corner avoidance tie-breaking
+            let next_pos = mv.apply(&you.body[0]);
+            let wall_distance = Self::calculate_wall_distance_metric(&next_pos, board.width, board.height);
+
+            // Priority 2 Fix: Corner avoidance tie-breaker
+            // If scores are very close (within 1000 points), prefer moves away from walls
+            // This prevents getting trapped in corners when multiple moves seem equally good
+            let score_threshold = 1000;
+            let should_update = if score > best_score + score_threshold {
+                // Clearly better score
+                true
+            } else if score >= best_score - score_threshold && score <= best_score + score_threshold {
+                // Scores are similar - use wall distance as tie-breaker
+                wall_distance > best_wall_distance
+            } else {
+                // Worse score
+                false
+            };
+
+            if should_update {
                 best_score = score;
+                best_wall_distance = wall_distance;
 
                 // Immediate update (anytime property)
                 shared.try_update_best(Self::direction_to_index(mv, config), best_score);
@@ -1402,6 +1438,92 @@ impl Bot {
         }
 
         false
+    }
+
+    /// Calculates wall distance metric for corner avoidance
+    /// Returns sum of distances to all 4 walls (higher = more central, safer)
+    /// Used as tie-breaker when move scores are similar
+    fn calculate_wall_distance_metric(pos: &Coord, board_width: i32, board_height: u32) -> i32 {
+        let dist_left = pos.x;
+        let dist_right = board_width - 1 - pos.x;
+        let dist_bottom = pos.y;
+        let dist_top = board_height as i32 - 1 - pos.y;
+
+        dist_left + dist_right + dist_bottom + dist_top
+    }
+
+    /// Finds immediately adjacent food that is safe to eat
+    /// Returns Some((direction, food_position)) if safe adjacent food exists
+    /// Returns None if no safe adjacent food or food is not distance-1
+    ///
+    /// This fixes the cycling bug where the bot circles around distance-1 food
+    /// Instead of searching, we take the food immediately if it's safe
+    fn find_immediate_safe_food(
+        board: &Board,
+        you: &Battlesnake,
+        turn: i32,
+        config: &Config,
+    ) -> Option<(Direction, Coord)> {
+        if you.body.is_empty() || board.food.is_empty() {
+            return None;
+        }
+
+        let head = you.body[0];
+
+        // Find all food that is exactly distance-1 (adjacent)
+        let adjacent_food: Vec<(Coord, Direction)> = board
+            .food
+            .iter()
+            .filter_map(|&food_pos| {
+                let dist = manhattan_distance(head, food_pos);
+                if dist == 1 {
+                    // Find which direction leads to this food
+                    for dir in Direction::all() {
+                        if dir.apply(&head) == food_pos {
+                            return Some((food_pos, dir));
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if adjacent_food.is_empty() {
+            return None;
+        }
+
+        // Check each adjacent food for safety
+        // Prioritize by: (1) safety, (2) escape routes after eating
+        let our_idx = board
+            .snakes
+            .iter()
+            .position(|s| s.id == you.id)
+            .unwrap_or(0);
+
+        let active_snakes = Self::determine_active_snakes(board, &you.id, turn, 2, config);
+
+        for (food_pos, dir) in adjacent_food {
+            // Check if this direction is legal
+            let legal_moves = Self::generate_legal_moves(board, you, config);
+            if !legal_moves.contains(&dir) {
+                continue;
+            }
+
+            // Check if food is actually safe (not a trap)
+            if !Self::is_food_actually_safe(board, food_pos, our_idx, &active_snakes, config) {
+                continue;
+            }
+
+            // Check escape routes after eating
+            let escape_routes = Self::count_escape_routes_after_eating(board, our_idx, food_pos);
+            if escape_routes >= config.scores.escape_route_min {
+                // Found safe food! Return immediately
+                return Some((dir, food_pos));
+            }
+        }
+
+        // No safe adjacent food found
+        None
     }
 
     /// Converts a direction to its encoded index
@@ -3192,9 +3314,11 @@ impl Bot {
 
     /// Determines which snakes are active (local) for IDAPOS optimization
     /// Returns indices of snakes within locality distance
+    /// V11.3: Uses turn-adaptive thresholds for awareness vs performance balance
     fn determine_active_snakes(
         board: &Board,
         our_snake_id: &str,
+        turn: i32,
         remaining_depth: u8,
         config: &Config,
     ) -> Vec<usize> {
@@ -3211,10 +3335,25 @@ impl Bot {
 
         let our_head = board.snakes[our_idx].body[0];
 
+        // V11.3: Turn-adaptive IDAPOS thresholds
+        // Early game: wider awareness to avoid long-term entrapment
+        // Late game: tighter filtering for performance
+        let (multiplier, max_distance) = if turn < config.idapos.early_game_turn_threshold {
+            (
+                config.idapos.early_game_head_distance_multiplier,
+                config.idapos.early_game_max_locality_distance,
+            )
+        } else {
+            (
+                config.idapos.late_game_head_distance_multiplier,
+                config.idapos.late_game_max_locality_distance,
+            )
+        };
+
         // Calculate locality threshold with maximum cap
         // Base threshold grows with depth, but cap prevents over-inclusion at high depths
-        let base_threshold = config.idapos.head_distance_multiplier * remaining_depth as i32;
-        let locality_threshold = std::cmp::min(base_threshold, config.idapos.max_locality_distance);
+        let base_threshold = multiplier * remaining_depth as i32;
+        let locality_threshold = std::cmp::min(base_threshold, max_distance);
 
         for (idx, snake) in board.snakes.iter().enumerate() {
             if idx == our_idx || snake.health <= 0 {
@@ -3318,6 +3457,7 @@ impl Bot {
     fn maxn_search(
         board: &Board,
         our_snake_id: &str,
+        turn: i32,
         depth: u8,
         depth_from_root: u8,
         current_player_idx: usize,
@@ -3344,7 +3484,7 @@ impl Bot {
 
         // IDAPOS: Determine active (local) snakes to reduce branching
         // Do this BEFORE terminal evaluation so we can optimize evaluation too
-        let active_snakes = Self::determine_active_snakes(board, our_snake_id, depth, config);
+        let active_snakes = Self::determine_active_snakes(board, our_snake_id, turn, depth, config);
 
         // Check for terminal state first
         if Self::is_terminal(board, our_snake_id, config) {
@@ -3361,6 +3501,7 @@ impl Bot {
                 return Self::maxn_search(
                     board,
                     our_snake_id,
+                    turn,
                     1, // Extended depth
                     depth_from_root + 1, // Going one ply deeper
                     current_player_idx,
@@ -3414,10 +3555,10 @@ impl Bot {
                 // Advance game state and reduce depth
                 let mut advanced_board = board.clone();
                 Self::advance_game_state(&mut advanced_board);
-                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, depth_from_root + 1, our_idx, config, tt, killers, history);
+                return Self::maxn_search(&advanced_board, our_snake_id, turn, depth - 1, depth_from_root + 1, our_idx, config, tt, killers, history);
             } else {
                 // Continue with next player at same depth
-                return Self::maxn_search(board, our_snake_id, depth, depth_from_root, next, config, tt, killers, history);
+                return Self::maxn_search(board, our_snake_id, turn, depth, depth_from_root, next, config, tt, killers, history);
             }
         }
 
@@ -3429,7 +3570,7 @@ impl Bot {
             let mut dead_board = board.clone();
             dead_board.snakes[current_player_idx].health = 0;
             let next = (current_player_idx + 1) % board.snakes.len();
-            return Self::maxn_search(&dead_board, our_snake_id, depth, depth_from_root, next, config, tt, killers, history);
+            return Self::maxn_search(&dead_board, our_snake_id, turn, depth, depth_from_root, next, config, tt, killers, history);
         }
 
         // Try to get best move from transposition table for move ordering
@@ -3452,10 +3593,10 @@ impl Bot {
             let child_tuple = if all_moved {
                 // All snakes have moved - advance game state and reduce depth
                 Self::advance_game_state(&mut child_board);
-                Self::maxn_search(&child_board, our_snake_id, depth - 1, depth_from_root + 1, our_idx, config, tt, killers, history)
+                Self::maxn_search(&child_board, our_snake_id, turn, depth - 1, depth_from_root + 1, our_idx, config, tt, killers, history)
             } else {
                 // Continue with next player at same depth
-                Self::maxn_search(&child_board, our_snake_id, depth, depth_from_root, next, config, tt, killers, history)
+                Self::maxn_search(&child_board, our_snake_id, turn, depth, depth_from_root, next, config, tt, killers, history)
             };
 
             // Update if current player improves their score
@@ -3705,6 +3846,7 @@ impl Bot {
     fn parallel_multiplayer_search(
         board: &Board,
         you: &Battlesnake,
+        turn: i32,
         depth: u8,
         shared: &Arc<SharedSearchState>,
         config: &Config,
@@ -3764,6 +3906,7 @@ impl Bot {
             let tuple = Self::maxn_search(
                 &child_board,
                 our_snake_id,
+                turn,
                 depth.saturating_sub(1),
                 1, // One ply down from root
                 our_idx,

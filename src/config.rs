@@ -191,8 +191,15 @@ pub struct ScoresConfig {
 /// IDAPOS (Locality Masking) constants
 #[derive(Debug, Deserialize, Clone)]
 pub struct IdaposConfig {
-    pub head_distance_multiplier: i32,
-    pub max_locality_distance: i32,
+    // Early game settings (wider awareness)
+    pub early_game_head_distance_multiplier: i32,
+    pub early_game_max_locality_distance: i32,
+    pub early_game_turn_threshold: i32,
+
+    // Late game settings (performance focus)
+    pub late_game_head_distance_multiplier: i32,
+    pub late_game_max_locality_distance: i32,
+
     pub min_snakes_for_alpha_beta: usize,
 }
 
@@ -378,8 +385,12 @@ impl Config {
                 articulation_point_enabled: true,
             },
             idapos: IdaposConfig {
-                head_distance_multiplier: 1,  // Aggressive locality masking: only snakes within depth distance
-                max_locality_distance: 5,     // Cap to prevent over-inclusion at high depths
+                // V11.3: Turn-adaptive IDAPOS for awareness vs performance balance
+                early_game_head_distance_multiplier: 2,
+                early_game_max_locality_distance: 8,
+                early_game_turn_threshold: 30,
+                late_game_head_distance_multiplier: 1,
+                late_game_max_locality_distance: 5,
                 min_snakes_for_alpha_beta: 2,
             },
             move_ordering: MoveOrderingConfig {
