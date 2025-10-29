@@ -138,6 +138,7 @@ pub struct ScoresConfig {
 
     // Adversarial entrapment constants
     pub adversarial_entrapment_distance: i32,
+    pub adversarial_body_threat_buffer: i32,  // V10: NEW
     pub adversarial_space_reduction_penalty: i32,
     pub adversarial_space_reduction_threshold: f32,
 
@@ -348,7 +349,8 @@ impl Config {
                 entrapment_moderate_threshold: 0.5,
                 entrapment_moderate_penalty_multiplier: 0.2,
                 // Adversarial entrapment constants
-                adversarial_entrapment_distance: 3,
+                adversarial_entrapment_distance: 4,  // V10: Increased from 3
+                adversarial_body_threat_buffer: 2,  // V10: NEW
                 adversarial_space_reduction_penalty: 10000,
                 adversarial_space_reduction_threshold: 0.2,
                 territory_scale_factor: 100.0,

@@ -266,7 +266,11 @@ entrapment_moderate_penalty_multiplier = 0.2
 
 # Adversarial Entrapment Constants
 # Distance threshold to consider opponent as "nearby threat"
-adversarial_entrapment_distance = 3
+# V10: Used in threat filtering - only opponents within this distance are considered
+adversarial_entrapment_distance = 4
+# V10: NEW - Opponent Body Threat Buffer
+# Only consider opponent bodies threatening if head is within (food_distance + this value)
+adversarial_body_threat_buffer = 2
 # Penalty when opponent can reduce our space by this percentage
 adversarial_space_reduction_penalty = 10000
 # Minimum space reduction percentage to trigger penalty (0.2 = 20%)
@@ -355,7 +359,7 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "optimized_v9.1.2.jsonl"
+log_file_path = "optimized_v10.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration

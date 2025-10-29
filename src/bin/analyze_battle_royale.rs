@@ -137,19 +137,23 @@ fn determine_active_snakes(
     let mut active = vec![our_idx];
     let our_head = snakes[our_idx].head;
 
+    // Calculate locality threshold with maximum cap
+    let base_threshold = config.idapos.head_distance_multiplier * remaining_depth;
+    let locality_threshold = std::cmp::min(base_threshold, config.idapos.max_locality_distance);
+
     for (idx, snake) in snakes.iter().enumerate() {
         if idx == our_idx || snake.body.is_empty() {
             continue;
         }
 
         let head_dist = manhattan_distance(our_head, snake.head);
-        if head_dist <= config.idapos.head_distance_multiplier * remaining_depth {
+        if head_dist <= locality_threshold {
             active.push(idx);
             continue;
         }
 
         for &segment in &snake.body {
-            if manhattan_distance(our_head, segment) <= remaining_depth {
+            if manhattan_distance(our_head, segment) <= locality_threshold {
                 active.push(idx);
                 break;
             }

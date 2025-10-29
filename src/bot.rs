@@ -1930,16 +1930,23 @@ impl Bot {
                     .min()
                     .unwrap_or(999);
 
-                // V9.1.2: Increased multipliers to reduce food aversion with clear advantage
-                // At low health (<50), always pursue distance-2 food aggressively
-                if snake.health < 50 {
-                    // Critical health: max multiplier for distance-2 food
+                // V10: More aggressive at critical health
+                if snake.health < 30 {
+                    // Critical health (<30): ALWAYS use max multiplier for distance-2 food
                     config.scores.survival_max_multiplier
+                } else if snake.health < 50 {
+                    // Low health (30-50): Use max multiplier only if clear advantage
+                    if nearest_opponent_dist >= nearest_food_dist + 3 {
+                        config.scores.survival_max_multiplier
+                    } else {
+                        // Moderate multiplier when contested
+                        config.scores.survival_max_multiplier * 0.6
+                    }
                 } else if nearest_opponent_dist >= nearest_food_dist + 3 {
-                    // Clear 3+ move advantage: use high multiplier (was 0.3x, now 0.8x)
+                    // High health but clear advantage: use high multiplier
                     config.scores.survival_max_multiplier * 0.8
                 } else {
-                    // Contested: moderate multiplier (was 0.05x, now 0.2x)
+                    // Contested: moderate multiplier
                     config.scores.survival_max_multiplier * 0.2
                 }
             } else {
@@ -2073,6 +2080,40 @@ impl Bot {
         health_disadvantage
     }
 
+    /// Check if opponent is actually threatening (head close enough to trap us)
+    /// V10: Filter out distant opponents whose bodies look scary but aren't active threats
+    fn is_opponent_threatening(
+        opponent_idx: usize,
+        our_head: Coord,
+        nearest_food: Option<Coord>,
+        board: &Board,
+        config: &Config,
+    ) -> bool {
+        if opponent_idx >= board.snakes.len() {
+            return false;
+        }
+
+        let opponent = &board.snakes[opponent_idx];
+        if opponent.health <= 0 || opponent.body.is_empty() {
+            return false;
+        }
+
+        let opp_head = opponent.body[0];
+        let head_distance = manhattan_distance(our_head, opp_head);
+
+        // Opponent is threatening if head is close enough to actively trap us
+        let threat_distance = if let Some(food) = nearest_food {
+            let food_dist = manhattan_distance(our_head, food);
+            // Opponent threatening if they can reach food area before/with us
+            // Use adversarial_body_threat_buffer from config
+            (food_dist + config.scores.adversarial_body_threat_buffer).min(6)  // Cap at 6 to avoid very distant snakes
+        } else {
+            config.scores.adversarial_entrapment_distance  // Default from config
+        };
+
+        head_distance <= threat_distance
+    }
+
     /// Computes space control score - how many cells are reachable
     /// Penalizes cramped positions that could lead to being trapped
     /// Uses IDAPOS-filtered active_snakes list for adversarial entrapment detection
@@ -2151,6 +2192,16 @@ impl Bot {
         }
 
         let our_head = our_snake.body[0];
+
+        // V10: Find nearest food for threat assessment
+        let nearest_food = if !board.food.is_empty() {
+            board.food.iter()
+                .min_by_key(|&&food| manhattan_distance(our_head, food))
+                .copied()
+        } else {
+            None
+        };
+
         let locality_threshold = config.scores.adversarial_entrapment_distance;
         let mut max_penalty = 0;
 
@@ -2158,6 +2209,11 @@ impl Bot {
         // This avoids redundant locality checks since active_snakes is already filtered
         for &opp_idx in active_snakes {
             if opp_idx == our_idx {
+                continue;
+            }
+
+            // V10: Only consider threatening opponents (head close enough to trap us)
+            if !Self::is_opponent_threatening(opp_idx, our_head, nearest_food, board, config) {
                 continue;
             }
 
@@ -2357,9 +2413,10 @@ impl Bot {
         100 - (dist_from_center * config.scores.center_bias_multiplier)
     }
 
-    /// Computes corner danger penalty - exponential penalty as snake approaches corners
+    /// Computes corner danger penalty with health-aware scaling
     /// V5 fix: Game 03 died at (10,10) after eating corner food - need to avoid corners
-    fn compute_corner_danger(pos: Coord, width: i32, height: i32, config: &Config) -> i32 {
+    /// V10: At critical health, accept corner risk if necessary for food
+    fn compute_corner_danger(pos: Coord, width: i32, height: i32, health: i32, config: &Config) -> i32 {
         // Distance to nearest corner
         let corners = [
             (0, 0),
@@ -2374,10 +2431,23 @@ impl Bot {
             .min()
             .unwrap_or(999);
 
-        // Apply exponential penalty when within threshold
+        // Apply penalty when within threshold
         if min_corner_dist <= config.scores.corner_danger_threshold {
-            // Exponential: at corner (0) = -5000, at distance 1 = -2500, at distance 2 = -1667, at distance 3 = -1250
-            -(config.scores.corner_danger_base / (min_corner_dist + 1))
+            let base_penalty = config.scores.corner_danger_base / (min_corner_dist + 1);
+
+            // V10: Scale penalty by health urgency
+            // At critical health (<20), accept corner risk for food
+            // At low health (20-50), reduce penalty to 50%
+            // At high health (>50), full penalty
+            let health_scale = if health < 20 {
+                0.2  // 20% of normal penalty at critical health
+            } else if health < 50 {
+                0.5  // 50% of normal penalty at low health
+            } else {
+                1.0  // Full penalty at high health
+            };
+
+            -(base_penalty as f32 * health_scale) as i32
         } else {
             0
         }
@@ -2961,7 +3031,7 @@ impl Bot {
                 (
                     Self::compute_wall_penalty(head, board.width as i32, board.height as i32, snake.health, config),
                     Self::compute_center_bias(head, board.width as i32, board.height as i32, config),
-                    Self::compute_corner_danger(head, board.width as i32, board.height as i32, config),
+                    Self::compute_corner_danger(head, board.width as i32, board.height as i32, snake.health, config),  // V10: Added health parameter
                 )
             } else {
                 (0, 0, 0)

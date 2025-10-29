@@ -1,6 +1,60 @@
 ## Version History
 
-### V9.1.2 (Current) - Food Pursuit Optimization: Increased Multipliers for Uncontested Food
+### V10 (Current) - Health-Aware Risk Assessment & Opponent Threat Filtering
+**Status:** COMPLETED - January 2025
+**Key Improvements:**
+- ✅ **Opponent Body Threat Filtering**: Only consider opponents threatening if head is close enough to trap us
+- ✅ **Health-Aware Corner Danger**: Scale corner penalty by health (20% at critical <20, 50% at low 20-50, 100% at high >50)
+- ✅ **More Aggressive Critical Health Multipliers**: Max multiplier for distance-2 food when health < 30 (was < 50)
+- ✅ **Confirmed User Hypothesis**: Turn 82 opponent body at distance 2 caused food avoidance despite head at distance 4
+
+**Motivation:**
+- V9.1.2 Game 4 analysis revealed cascade of conservative decisions leading to starvation death
+- Turn 82: Opponent body proximity caused safe food avoidance (user's hypothesis CONFIRMED ✅)
+- Turn 87: Critical health (13) + adjacent food, but corner penalty overwhelmed food bonus → chose corner trap
+- Root cause: Conservative penalties not health-aware, opponent bodies treated as threats regardless of head position
+
+**Changes:**
+```
+Opponent Threat Filtering (src/bot.rs:2076-2108):
+  - Added is_opponent_threatening() helper
+  - Only consider opponent if head within (food_distance + 2), capped at 6
+  - Modified compute_adversarial_entrapment_penalty() to filter opponents
+
+Health-Aware Corner Danger (src/bot.rs:2409-2447):
+  - Health < 20: 20% penalty (critical - accept corner risk for food)
+  - Health 20-50: 50% penalty (low - reduced caution)
+  - Health > 50: 100% penalty (high - full caution)
+
+Critical Health Multipliers (src/bot.rs:1917-1951):
+  - Distance 2, health < 30: ALWAYS max multiplier (was conditional at < 50)
+  - More aggressive at 13-30 health range
+
+Configuration (Snake.toml):
+  - adversarial_body_threat_buffer = 2 (NEW)
+  - adversarial_entrapment_distance = 4 (increased from 3)
+```
+
+**Replay Verification:**
+- Turn 82: MATCHED (depth-2 tactical reasoning still conservative)
+- Turn 86: MISMATCH - Changed from "down" (toward corner) → "left" (away from corner) ✅
+- Turn 87: MISMATCH - Changed from "left" (corner trap → death) → "right" (eat food!) ✅
+- Critical fix validated: Bot now eats adjacent food at health=13 instead of entering corner
+
+**Expected Impact:**
+- Fewer starvation deaths from conservative food avoidance
+- Better risk assessment at critical health (<30)
+- Less spooked by distant opponent bodies when heads aren't threatening
+- Corners acceptable as last resort at very low health
+
+**GAPS.md Corrections:**
+- ❌ INCORRECT: "AdaptiveTimeEstimator Never Used" - It IS used (bot.rs:947, 1049)
+- ❌ INCORRECT: "HashMap for Control Map" - Already uses Vec (bot.rs:1719)
+- ❌ INCORRECT: "Conservative IDAPOS" - Already aggressive (multiplier=1, max_distance=5)
+
+---
+
+### V9.1.2 - Food Pursuit Optimization: Increased Multipliers for Uncontested Food
 **Status:** COMPLETED - January 2025
 **Key Improvements:**
 - ✅ **Increased urgency multipliers** for distance 2-5 food with clear opponent advantage
@@ -196,45 +250,45 @@ Distance 3+ food:
 
 ---
 
-## Critical Missing Optimizations
+## Verified Optimizations (Already Implemented) - V10 Audit
 
-### 1. **AdaptiveTimeEstimator Never Used**
-You have the struct but never actually instantiate or use it:
-```rust
-// You define this elaborate struct...
-struct AdaptiveTimeEstimator { /* ... */ }
+### ✅ **AdaptiveTimeEstimator IS Being Used**
+**Claim:** "AdaptiveTimeEstimator Never Used"
+**Reality:** ✅ INCORRECT - It IS actively used!
+- Instantiated: src/bot.rs:947 (1v1) and src/bot.rs:1049 (multiplayer)
+- Used for time estimation blending empirical data with exponential model
+- Configuration: model_weight = 0.1 (90% empirical, 10% model)
 
-// But then just use raw exponential formula:
-let exponent = (current_depth as f64) * (num_active_snakes as f64);
-let estimated_time = (time_params.base_iteration_time_ms * 
-    time_params.branching_factor.powf(exponent)).ceil() as u64;
-```
+### ✅ **Control Maps Already Use Vec, Not HashMap**
+**Claim:** "HashMap for Control Map is slower than flat array"
+**Reality:** ✅ INCORRECT - Already using Vec!
+- Implementation: src/bot.rs:1719 uses `vec![None; size]`
+- No HashMap performance issues
+- Efficient flat array access
 
-### 2. **Transposition Table Not Optimal**
-While implemented, it has issues:
+### ✅ **IDAPOS Already Aggressive**
+**Claim:** "Conservative IDAPOS with multiplier=2"
+**Reality:** ✅ INCORRECT - Already optimized!
+- Current: head_distance_multiplier = 1 (Snake.toml:302)
+- Current: max_locality_distance = 5 (Snake.toml:307)
+- At depth 10: considers snakes within distance 5 (not 10!), capped
+- Battle royale efficiency: 1-2 active snakes typical
+
+## Remaining Optimization Opportunities
+
+### Transposition Table Enhancement
+**Status:** Worth investigating
 - Only stores single scores, not bounds (should store EXACT, LOWER_BOUND, UPPER_BOUND types)
 - No move storage (should store best move to improve move ordering)
 - Simple age-based eviction instead of replacement schemes like TT-priority
 
-## Performance Issues
+### Move Ordering Improvements
+**Status:** Partially implemented
+- ✅ Killer moves already implemented (Snake.toml:32)
+- ✅ PV ordering already enabled (Snake.toml:34)
+- Consider: History heuristic for quiet moves
 
-### 3. **HashMap for Control Map**
-Using `HashMap<Coord, usize>` for control maps is slower than a flat array:
-```rust
-// Better:
-let mut control_map = vec![None; (board.width * board.height) as usize];
-```
-
-## Algorithm Gaps
-
-
-### 4. **Conservative IDAPOS**
-Your locality threshold is quite generous:
-```rust
-let locality_threshold = config.idapos.head_distance_multiplier * remaining_depth as i32;
-```
-With multiplier=2, at depth 6 you're considering snakes 12 squares away - that's most of the board!
-
-## Quick Fixes for Big Gains
-2. **Actually use AdaptiveTimeEstimator** - Better time management
-5. **Reduce IDAPOS locality** - Try multiplier=1.5 or even 1.0
+### Quiescence Search Enhancement
+**Status:** Implemented but could be tuned
+- Already implemented for tactical positions
+- May need tuning for food contestation scenarios
