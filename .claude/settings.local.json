@@ -62,7 +62,15 @@
       "Bash(./target/release/profile_slow_turns:*)",
       "Bash(timeout 180 sh:*)",
       "Bash(pkill:*)",
-      "Bash(./target/release/find_timeouts:*)"
+      "Bash(./target/release/find_timeouts:*)",
+      "Bash(./target/release/analyze_trap_decisions:*)",
+      "Bash(./target/release/diagnose_illegal_moves:*)",
+      "Bash(do echo \"═══════════════════════════════════════════════════════════\")",
+      "Bash(jq:*)",
+      "Bash(do grep \"\"\"turn\"\":$turn,\" tests/fixtures/learning_suite/game_03.jsonl)",
+      "Bash(paste:*)",
+      "Bash(./target/release/tune_head_collision_penalty:*)",
+      "Bash(do echo \"═══════════════════════════════════════════════════════════\" echo \"Replaying: $game\" echo \"═══════════════════════════════════════════════════════════\" ./target/release/replay \"$game\" --all)"
     ],
     "deny": [],
     "ask": []

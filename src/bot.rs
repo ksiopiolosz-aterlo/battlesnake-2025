@@ -343,13 +343,101 @@ impl KillerMoveTable {
     }
 }
 
+/// History Heuristic Table for move ordering
+/// Tracks globally successful moves (not depth-specific like killers)
+/// Complements killer heuristic by learning which moves work well across all positions
+pub struct HistoryTable {
+    /// Scores indexed by [position][direction]
+    /// Position is flattened: index = y * width + x
+    /// Higher scores = more likely to cause cutoffs
+    scores: Vec<[i32; 4]>,  // 4 directions: Up, Down, Left, Right
+    width: usize,
+    height: usize,
+}
+
+impl HistoryTable {
+    /// Creates a new history table for the given board dimensions
+    pub fn new(width: u32, height: u32) -> Self {
+        let width = width as usize;
+        let height = height as usize;
+        let size = width * height;
+
+        HistoryTable {
+            scores: vec![[0; 4]; size],
+            width,
+            height,
+        }
+    }
+
+    /// Updates history score for a move
+    /// Exponential bonus for cutoffs (2^depth), smaller penalty for non-cutoffs
+    pub fn update(&mut self, coord: &Coord, dir: Direction, depth: u8, caused_cutoff: bool) {
+        let x = coord.x as usize;
+        let y = coord.y as usize;
+
+        if x >= self.width || y >= self.height {
+            return;  // Out of bounds
+        }
+
+        let pos_idx = y * self.width + x;
+        let dir_idx = direction_to_index(dir);
+
+        let bonus = if caused_cutoff {
+            // Exponential bonus by depth (deeper cutoffs are more valuable)
+            1 << depth.min(10)  // Cap at 2^10 to prevent overflow
+        } else {
+            // Small penalty for moves that didn't cause cutoffs
+            -(1 << (depth / 2).min(5))  // Smaller penalty, also capped
+        };
+
+        // Saturating add to prevent overflow
+        self.scores[pos_idx][dir_idx] = self.scores[pos_idx][dir_idx].saturating_add(bonus);
+    }
+
+    /// Gets the history score for a move
+    /// Higher scores indicate moves that historically cause more cutoffs
+    pub fn get_score(&self, coord: &Coord, dir: Direction) -> i32 {
+        let x = coord.x as usize;
+        let y = coord.y as usize;
+
+        if x >= self.width || y >= self.height {
+            return 0;  // Out of bounds
+        }
+
+        let pos_idx = y * self.width + x;
+        let dir_idx = direction_to_index(dir);
+
+        self.scores[pos_idx][dir_idx]
+    }
+
+    /// Clears all history scores (called at start of new game or search tree)
+    /// Note: Unlike killers, history often persists across iterations
+    /// but we clear it per root position for freshness
+    pub fn clear(&mut self) {
+        for scores in &mut self.scores {
+            scores.fill(0);
+        }
+    }
+}
+
+/// Helper function to convert Direction to array index
+fn direction_to_index(dir: Direction) -> usize {
+    match dir {
+        Direction::Up => 0,
+        Direction::Down => 1,
+        Direction::Left => 2,
+        Direction::Right => 3,
+    }
+}
+
 /// Orders moves for better alpha-beta pruning
-/// Priority: PV move > killer moves > remaining moves
+/// Priority: PV move > killer moves > history scores > remaining moves
 /// This can improve alpha-beta efficiency by 50-80%
 fn order_moves(
     moves: Vec<Direction>,
     pv_move: Option<Direction>,
     killers: &KillerMoveTable,
+    history: Option<(&HistoryTable, &Coord)>,  // (history_table, current_position)
     depth: u8,
     config: &Config,
 ) -> Vec<Direction> {
@@ -373,10 +461,25 @@ fn order_moves(
         }
     }
 
-    // Priority 3: Remaining moves
-    for &mv in &moves {
-        if !ordered.contains(&mv) {
+    // Priority 3: History heuristic - sort remaining moves by history score
+    if let Some((hist, pos)) = history {
+        let mut remaining: Vec<_> = moves.iter()
+            .filter(|&&mv| !ordered.contains(&mv))
+            .map(|&mv| (mv, hist.get_score(pos, mv)))
+            .collect();
+
+        // Sort by history score (descending - higher scores first)
+        remaining.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (mv, _score) in remaining {
             ordered.push(mv);
+        }
+    } else {
+        // Priority 4: Remaining moves (if no history available)
+        for &mv in &moves {
+            if !ordered.contains(&mv) {
+                ordered.push(mv);
+            }
         }
     }
 
@@ -574,6 +677,10 @@ impl Bot {
         let mut killers = KillerMoveTable::new(config);
         let mut pv_move: Option<Direction> = None;
 
+        // Create history table for move ordering
+        // Tracks globally successful moves across all positions
+        let mut history = HistoryTable::new(board.width as u32, board.height as u32);
+
         // Determine execution strategy
         let num_alive_snakes = board.snakes.iter().filter(|s| s.health > 0).count();
         let num_cpus = rayon::current_num_threads();
@@ -657,8 +764,9 @@ impl Bot {
             );
             shared.current_depth.store(current_depth, Ordering::Release);
 
-            // Clear killers from previous iteration
+            // Clear killers and history from previous iteration
             killers.clear();
+            history.clear();
 
             // Record iteration start time
             let iteration_start = Instant::now();
@@ -666,13 +774,13 @@ impl Bot {
             // Execute search with strategy-specific parameters
             match strategy {
                 ExecutionStrategy::Sequential => {
-                    Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, pv_move);
+                    Self::sequential_search(board, you, current_depth, &shared, config, &tt, &mut killers, &mut history, pv_move);
                 }
                 ExecutionStrategy::Parallel1v1 => {
-                    Self::parallel_1v1_search(board, you, current_depth, &shared, config, &tt, pv_move);
+                    Self::parallel_1v1_search(board, you, current_depth, &shared, config, &tt, &mut history, pv_move);
                 }
                 ExecutionStrategy::ParallelMultiplayer => {
-                    Self::parallel_multiplayer_search(board, you, current_depth, &shared, config, &tt, pv_move);
+                    Self::parallel_multiplayer_search(board, you, current_depth, &shared, config, &tt, &mut history, pv_move);
                 }
             }
 
@@ -739,6 +847,7 @@ impl Bot {
         config: &Config,
         tt: &Arc<TranspositionTable>,
         killers: &mut KillerMoveTable,
+        history: &mut HistoryTable,
         pv_move: Option<Direction>,
     ) {
         // Generate legal moves for our snake
@@ -765,8 +874,8 @@ impl Bot {
         }
 
         // Order moves for better alpha-beta pruning
-        // Priority: PV move > killer moves > remaining moves
-        legal_moves = order_moves(legal_moves, pv_move, killers, depth, config);
+        // Priority: PV move > killer moves > history heuristic > remaining moves
+        legal_moves = order_moves(legal_moves, pv_move, killers, Some((history, &you.body[0])), depth, config);
 
         info!("Evaluating {} legal moves sequentially (ordered by PV + killers)", legal_moves.len());
 
@@ -799,6 +908,7 @@ impl Bot {
                     config,
                     tt,
                     killers,
+                    history,
                 )
             } else {
                 // Use MaxN for multiplayer
@@ -810,6 +920,7 @@ impl Bot {
                     config,
                     tt,
                     killers,
+                    history,
                 );
                 tuple.for_player(our_idx)
             };
@@ -1987,8 +2098,9 @@ impl Bot {
             }
         }
 
-        // Create local killer table for this search
+        // Create local killer table and history table for this search
         let mut killers = KillerMoveTable::new(config);
+        let mut history = HistoryTable::new(board.width as u32, board.height as u32);
 
         // Use alpha-beta to get our score
         let our_score = Self::alpha_beta_minimax(
@@ -2001,6 +2113,7 @@ impl Bot {
             config,
             tt,
             &mut killers,
+            &mut history,
         );
 
         // Create score tuple with our score and opponent's inverse
@@ -2022,6 +2135,7 @@ impl Bot {
         config: &Config,
         tt: &Arc<TranspositionTable>,
         killers: &mut KillerMoveTable,
+        history: &mut HistoryTable,
     ) -> ScoreTuple {
         let _prof = simple_profiler::ProfileGuard::new("maxn");
 
@@ -2086,10 +2200,10 @@ impl Bot {
                 // Advance game state and reduce depth
                 let mut advanced_board = board.clone();
                 Self::advance_game_state(&mut advanced_board);
-                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, our_idx, config, tt, killers);
+                return Self::maxn_search(&advanced_board, our_snake_id, depth - 1, our_idx, config, tt, killers, history);
             } else {
                 // Continue with next player at same depth
-                return Self::maxn_search(board, our_snake_id, depth, next, config, tt, killers);
+                return Self::maxn_search(board, our_snake_id, depth, next, config, tt, killers, history);
             }
         }
 
@@ -2101,11 +2215,12 @@ impl Bot {
             let mut dead_board = board.clone();
             dead_board.snakes[current_player_idx].health = 0;
             let next = (current_player_idx + 1) % board.snakes.len();
-            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config, tt, killers);
+            return Self::maxn_search(&dead_board, our_snake_id, depth, next, config, tt, killers, history);
         }
 
-        // Order moves (no PV at interior nodes in MaxN, but use killers)
-        moves = order_moves(moves, None, killers, depth, config);
+        // Order moves using history heuristic for better move ordering
+        let current_pos = &board.snakes[current_player_idx].body[0];
+        moves = order_moves(moves, None, killers, Some((history, current_pos)), depth, config);
 
         let mut best_tuple =
             ScoreTuple::new_with_value(board.snakes.len(), i32::MIN);
@@ -2120,16 +2235,18 @@ impl Bot {
             let child_tuple = if all_moved {
                 // All snakes have moved - advance game state and reduce depth
                 Self::advance_game_state(&mut child_board);
-                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config, tt, killers)
+                Self::maxn_search(&child_board, our_snake_id, depth - 1, our_idx, config, tt, killers, history)
             } else {
                 // Continue with next player at same depth
-                Self::maxn_search(&child_board, our_snake_id, depth, next, config, tt, killers)
+                Self::maxn_search(&child_board, our_snake_id, depth, next, config, tt, killers, history)
             };
 
             // Update if current player improves their score
             if child_tuple.for_player(current_player_idx)
                 > best_tuple.for_player(current_player_idx)
             {
+                // Update history for this good move
+                history.update(current_pos, mv, depth, false);
                 best_tuple = child_tuple;
             } else if child_tuple.for_player(current_player_idx)
                 == best_tuple.for_player(current_player_idx)
@@ -2156,6 +2273,7 @@ impl Bot {
         config: &Config,
         tt: &Arc<TranspositionTable>,
         killers: &mut KillerMoveTable,
+        history: &mut HistoryTable,
     ) -> i32 {
         let _prof = simple_profiler::ProfileGuard::new("alpha_beta");
 
@@ -2221,11 +2339,14 @@ impl Bot {
                 config,
                 tt,
                 killers,
+                history,
             );
         }
 
-        // Order moves for better alpha-beta pruning (no PV at interior nodes, only killers)
-        moves = order_moves(moves, None, killers, depth, config);
+        // Order moves for better alpha-beta pruning
+        // Use history heuristic for move ordering (no PV at interior nodes)
+        let current_pos = &board.snakes[player_idx].body[0];
+        moves = order_moves(moves, None, killers, Some((history, current_pos)), depth, config);
 
         if is_max {
             let mut max_eval = i32::MIN;
@@ -2244,12 +2365,14 @@ impl Bot {
                     config,
                     tt,
                     killers,
+                    history,
                 );
                 max_eval = max_eval.max(eval);
                 alpha = alpha.max(eval);
                 if beta <= alpha {
-                    // Beta cutoff: record this move as a killer
+                    // Beta cutoff: record this move as a killer and update history
                     killers.record_killer(depth, mv, config);
+                    history.update(current_pos, mv, depth, true);
                     simple_profiler::record_alpha_beta_cutoff();
                     break;
                 }
@@ -2273,12 +2396,14 @@ impl Bot {
                     config,
                     tt,
                     killers,
+                    history,
                 );
                 min_eval = min_eval.min(eval);
                 beta = beta.min(eval);
                 if beta <= alpha {
-                    // Alpha cutoff: record this move as a killer
+                    // Alpha cutoff: record this move as a killer and update history
                     killers.record_killer(depth, mv, config);
+                    history.update(current_pos, mv, depth, true);
                     simple_profiler::record_alpha_beta_cutoff();
                     break;
                 }
@@ -2297,14 +2422,15 @@ impl Bot {
         shared: &Arc<SharedSearchState>,
         config: &Config,
         tt: &Arc<TranspositionTable>,
+        _history: &mut HistoryTable,  // Unused in parallel search (each thread has its own)
         pv_move: Option<Direction>,
     ) {
         // Order moves using PV move from previous iteration
         let mut legal_moves = Self::generate_legal_moves(board, you, config);
 
         if !legal_moves.is_empty() {
-            // Order root moves by PV (no killers at root for parallel search)
-            legal_moves = order_moves(legal_moves, pv_move, &KillerMoveTable::new(config), depth, config);
+            // Order root moves by PV only (no killers/history at root for parallel search)
+            legal_moves = order_moves(legal_moves, pv_move, &KillerMoveTable::new(config), None, depth, config);
         }
 
         if legal_moves.is_empty() {
@@ -2341,8 +2467,9 @@ impl Bot {
 
         // Parallel evaluation of root moves
         legal_moves.par_iter().enumerate().for_each(|(_idx, &mv)| {
-            // Each thread needs its own killers table (can't share mutable refs across threads)
+            // Each thread needs its own killers and history tables (can't share mutable refs across threads)
             let mut local_killers = KillerMoveTable::new(config);
+            let mut local_history = HistoryTable::new(board.width as u32, board.height as u32);
 
             let mut child_board = board.clone();
             Self::apply_move(&mut child_board, our_idx, mv, config);
@@ -2355,6 +2482,7 @@ impl Bot {
                 config,
                 tt,
                 &mut local_killers,
+                &mut local_history,
             );
             let our_score = tuple.for_player(our_idx);
 
@@ -2378,14 +2506,15 @@ impl Bot {
         shared: &Arc<SharedSearchState>,
         config: &Config,
         tt: &Arc<TranspositionTable>,
+        _history: &mut HistoryTable,  // Unused in parallel search (each thread has its own)
         pv_move: Option<Direction>,
     ) {
         // Order moves using PV move from previous iteration
         let mut legal_moves = Self::generate_legal_moves(board, you, config);
 
         if !legal_moves.is_empty() {
-            // Order root moves by PV (no killers at root for parallel search)
-            legal_moves = order_moves(legal_moves, pv_move, &KillerMoveTable::new(config), depth, config);
+            // Order root moves by PV only (no killers/history at root for parallel search)
+            legal_moves = order_moves(legal_moves, pv_move, &KillerMoveTable::new(config), None, depth, config);
         }
 
         if legal_moves.is_empty() {
@@ -2422,8 +2551,9 @@ impl Bot {
 
         // Parallel evaluation of root moves
         legal_moves.par_iter().enumerate().for_each(|(_idx, &mv)| {
-            // Create local killer table for this subtree (each thread gets its own)
+            // Create local killer table and history table for this subtree (each thread gets its own)
             let mut local_killers = KillerMoveTable::new(config);
+            let mut local_history = HistoryTable::new(board.width as u32, board.height as u32);
 
             let mut child_board = board.clone();
             Self::apply_move(&mut child_board, our_idx, mv, config);
@@ -2438,6 +2568,7 @@ impl Bot {
                 config,
                 tt,
                 &mut local_killers,
+                &mut local_history,
             );
 
             // Atomic update of best move and score together (prevents race conditions)
