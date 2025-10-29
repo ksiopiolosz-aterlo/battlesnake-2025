@@ -420,6 +420,11 @@ impl HistoryTable {
     }
 }
 
+/// Calculates Manhattan distance between two coordinates
+fn manhattan_distance(a: Coord, b: Coord) -> i32 {
+    (a.x - b.x).abs() + (a.y - b.y).abs()
+}
+
 /// Helper function to convert Direction to array index
 fn direction_to_index(dir: Direction) -> usize {
     match dir {
@@ -428,6 +433,53 @@ fn direction_to_index(dir: Direction) -> usize {
         Direction::Left => 2,
         Direction::Right => 3,
     }
+}
+
+/// Detects if a position is "unstable" and needs quiescence search extension
+/// Unstable positions in Battlesnake:
+/// 1. Head is adjacent to food (eating will change evaluation dramatically)
+/// 2. Opponent heads are nearby (head-to-head collision risk)
+/// 3. Health is critically low (starvation imminent)
+fn is_position_unstable(board: &Board, our_snake_id: &str, config: &Config) -> bool {
+    let our_snake = match board.snakes.iter().find(|s| &s.id == our_snake_id) {
+        Some(s) if s.health > 0 => s,
+        _ => return false,
+    };
+
+    let our_head = our_snake.body[0];
+
+    // Check 1: Is head adjacent to food?
+    for &food in &board.food {
+        if manhattan_distance(our_head, food) == 1 {
+            return true; // About to eat food
+        }
+    }
+
+    // Check 2: Are opponent heads nearby? (head-to-head collision risk)
+    for opponent in &board.snakes {
+        if opponent.id == our_snake_id || opponent.health == 0 {
+            continue;
+        }
+
+        let opp_head = opponent.body[0];
+        let head_dist = manhattan_distance(our_head, opp_head);
+
+        // If heads are 1-2 moves apart, this is tactically critical
+        if head_dist <= 2 {
+            return true;
+        }
+    }
+
+    // Check 3: Critical health and food is nearby?
+    if our_snake.health <= 15 {
+        for &food in &board.food {
+            if manhattan_distance(our_head, food) <= 3 {
+                return true; // Starvation risk with nearby food
+            }
+        }
+    }
+
+    false
 }
 
 /// Orders moves for better alpha-beta pruning
@@ -1074,11 +1126,6 @@ impl Bot {
         false
     }
 
-    /// Calculates Manhattan distance between two coordinates
-    fn manhattan_distance(a: Coord, b: Coord) -> i32 {
-        (a.x - b.x).abs() + (a.y - b.y).abs()
-    }
-
     /// Converts a direction to its encoded index
     pub fn direction_to_index(dir: Direction, config: &Config) -> u8 {
         match dir {
@@ -1545,7 +1592,7 @@ impl Bot {
         let nearest_food_dist = board
             .food
             .iter()
-            .map(|&food| Self::manhattan_distance(head, food))
+            .map(|&food| manhattan_distance(head, food))
             .min()
             .unwrap_or(config.scores.default_food_distance);
 
@@ -1579,7 +1626,7 @@ impl Bot {
                     return false;
                 }
                 // Only consider opponents within threat range
-                let dist = Self::manhattan_distance(head, s.body[0]);
+                let dist = manhattan_distance(head, s.body[0]);
                 dist <= config.scores.health_threat_distance
             })
             .map(|(_, s)| s.health)
@@ -1695,7 +1742,7 @@ impl Bot {
             }
 
             // Check if opponent is within entrapment distance
-            let distance = Self::manhattan_distance(our_head, opponent.body[0]);
+            let distance = manhattan_distance(our_head, opponent.body[0]);
             if distance > locality_threshold {
                 continue; // Snake too far away to pose entrapment threat
             }
@@ -1769,7 +1816,7 @@ impl Bot {
 
             // Head-to-head advantage if longer
             if our_snake.length > opponent.length {
-                let dist = Self::manhattan_distance(our_head, opponent.body[0]);
+                let dist = manhattan_distance(our_head, opponent.body[0]);
                 if dist <= config.scores.attack_head_to_head_distance {
                     attack += config.scores.attack_head_to_head_bonus;
                 }
@@ -2036,7 +2083,7 @@ impl Bot {
             }
 
             // Check head distance
-            let head_dist = Self::manhattan_distance(our_head, snake.body[0]);
+            let head_dist = manhattan_distance(our_head, snake.body[0]);
             if head_dist <= locality_threshold {
                 active.push(idx);
                 continue;
@@ -2044,7 +2091,7 @@ impl Bot {
 
             // Check any body segment distance
             for &segment in &snake.body {
-                if Self::manhattan_distance(our_head, segment) <= remaining_depth as i32 {
+                if manhattan_distance(our_head, segment) <= remaining_depth as i32 {
                     active.push(idx);
                     break;
                 }
@@ -2157,8 +2204,31 @@ impl Bot {
         // Do this BEFORE terminal evaluation so we can optimize evaluation too
         let active_snakes = Self::determine_active_snakes(board, our_snake_id, depth, config);
 
-        // Terminal conditions
-        if depth == 0 || Self::is_terminal(board, our_snake_id, config) {
+        // Check for terminal state first
+        if Self::is_terminal(board, our_snake_id, config) {
+            let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes));
+            tt.store(board_hash, eval.for_player(our_idx), depth);
+            return eval;
+        }
+
+        // At depth 0, check if position is unstable (quiescence extension)
+        if depth == 0 {
+            if is_position_unstable(board, our_snake_id, config) {
+                // Extend search by 1 ply for tactically critical positions
+                // Recompute active snakes for extended depth
+                return Self::maxn_search(
+                    board,
+                    our_snake_id,
+                    1, // Extended depth
+                    current_player_idx,
+                    config,
+                    tt,
+                    killers,
+                    history,
+                );
+            }
+
+            // Stable position at depth 0, evaluate normally
             let eval = Self::evaluate_state(board, our_snake_id, config, Some(&active_snakes));
             tt.store(board_hash, eval.for_player(our_idx), depth);
             return eval;
@@ -2285,8 +2355,39 @@ impl Bot {
         }
         simple_profiler::record_tt_lookup(false);
 
-        if depth == 0 || Self::is_terminal(board, our_snake_id, config) {
-            // In alpha-beta (1v1), no need to filter - only 2 snakes
+        // Check for terminal state first
+        if Self::is_terminal(board, our_snake_id, config) {
+            let scores = Self::evaluate_state(board, our_snake_id, config, None);
+            let our_idx = board
+                .snakes
+                .iter()
+                .position(|s| &s.id == our_snake_id)
+                .unwrap_or(0);
+            let score = scores.for_player(our_idx);
+            tt.store(board_hash, score, depth);
+            return score;
+        }
+
+        // At depth 0, check if position is unstable (quiescence extension)
+        if depth == 0 {
+            if is_position_unstable(board, our_snake_id, config) {
+                // Extend search by 1 ply for tactically critical positions
+                // This helps avoid horizon effect on food eating and collisions
+                return Self::alpha_beta_minimax(
+                    board,
+                    our_snake_id,
+                    1, // Extended depth
+                    alpha,
+                    beta,
+                    is_max,
+                    config,
+                    tt,
+                    killers,
+                    history,
+                );
+            }
+
+            // Stable position at depth 0, evaluate normally
             let scores = Self::evaluate_state(board, our_snake_id, config, None);
             let our_idx = board
                 .snakes
