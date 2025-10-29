@@ -44,6 +44,7 @@ impl TimingConfig {
 /// Time estimation constants for iterative deepening
 #[derive(Debug, Deserialize, Clone)]
 pub struct TimeEstimationConfig {
+    pub model_weight: f64,
     pub one_vs_one: GameModeTimeEstimation,
     pub multiplayer: GameModeTimeEstimation,
 }
@@ -100,6 +101,8 @@ pub struct ScoresConfig {
     pub health_max: f32,
     pub score_starvation_base: i32,
     pub health_threat_distance: i32,
+    pub immediate_food_bonus: i32,
+    pub immediate_food_distance: i32,
 
     // Space control constants
     pub space_safety_margin: usize,
@@ -142,6 +145,32 @@ pub struct ScoresConfig {
 
     // Center bias
     pub center_bias_multiplier: i32,
+
+    // Corner danger penalty
+    pub corner_danger_base: i32,
+    pub corner_danger_threshold: i32,
+
+    // Escape route evaluation
+    pub escape_route_penalty_base: i32,
+    pub escape_route_penalty_health_scale: bool,
+    pub escape_route_min: i32,
+
+    // Safe food bonus
+    pub safe_food_bonus: i32,
+    pub safe_food_center_threshold: i32,
+
+    // Length advantage bonus
+    pub length_advantage_bonus: i32,
+
+    // Tail-chasing detection
+    pub tail_chasing_detection_distance: i32,
+    pub tail_chasing_penalty_per_segment: i32,
+    pub tail_chasing_penalty_exponent: f32,
+    pub tail_chasing_opponent_distance: i32,
+
+    // Articulation point detection
+    pub articulation_point_penalty: i32,
+    pub articulation_point_enabled: bool,
 }
 
 /// IDAPOS (Locality Masking) constants
@@ -251,13 +280,14 @@ impl Config {
                 max_search_depth: 20,
             },
             time_estimation: TimeEstimationConfig {
+                model_weight: 0.1,  // Reduced from 0.4 - favor empirical observations
                 one_vs_one: GameModeTimeEstimation {
                     base_iteration_time_ms: 0.01,
-                    branching_factor: 2.75,  // Tuned with move ordering: achieves depth 5.76 with 0% timeouts
+                    branching_factor: 2.2,  // Initial model (will adapt via AdaptiveTimeEstimator)
                 },
                 multiplayer: GameModeTimeEstimation {
                     base_iteration_time_ms: 0.01,
-                    branching_factor: 4.0,  // Conservative: no data yet
+                    branching_factor: 1.2,  // Reduced from 1.6 for deeper search
                 },
             },
             strategy: StrategyConfig {
@@ -268,16 +298,18 @@ impl Config {
                 score_dead_snake: i32::MIN + 1000,
                 score_survival_penalty: -1_000_000,
                 score_survival_weight: 1000.0,
-                weight_space: 20.0,
-                weight_health: 20.0,
+                weight_space: 25.0,  // Reduced from 30.0 to balance food acquisition
+                weight_health: 75.0,  // Increased from 50.0 for better food seeking
                 weight_control: 3.0,
-                weight_attack: 2.0,
+                weight_attack: 10.0,  // Increased from 2.0 for aggressive play
                 weight_length: 100,
                 score_zero_health: -100_000,
                 default_food_distance: 999,
                 health_max: 100.0,
                 score_starvation_base: -50_000,
                 health_threat_distance: 3,
+                immediate_food_bonus: 5000,
+                immediate_food_distance: 1,
                 space_safety_margin: 5,
                 space_shortage_penalty: 100,
                 // Length-aware health constants
@@ -298,16 +330,30 @@ impl Config {
                 adversarial_space_reduction_threshold: 0.2,
                 territory_scale_factor: 100.0,
                 attack_head_to_head_distance: 3,
-                attack_head_to_head_bonus: 50,
+                attack_head_to_head_bonus: 200,  // Increased from 50 for aggressive kills
                 attack_trap_margin: 3,
-                attack_trap_bonus: 100,
+                attack_trap_bonus: 300,  // Increased from 100 to reward trapping
                 head_collision_penalty: -50_000,
-                wall_penalty_base: 1000,
+                wall_penalty_base: 500,  // Reduced from 1000 to allow edge food acquisition
                 safe_distance_from_wall: 3,
-                center_bias_multiplier: 10,
+                center_bias_multiplier: 50,  // Increased from 10 to prevent wall-hugging
+                corner_danger_base: 5000,
+                corner_danger_threshold: 3,
+                escape_route_penalty_base: -1500,  // V6: Reduced from -3000 to allow safe food acquisition
+                escape_route_penalty_health_scale: true,
+                escape_route_min: 2,
+                safe_food_bonus: 2000,  // V6: Bonus for food in safe central area
+                safe_food_center_threshold: 3,
+                length_advantage_bonus: 200,
+                tail_chasing_detection_distance: 2,
+                tail_chasing_penalty_per_segment: 300,
+                tail_chasing_penalty_exponent: 2.0,
+                tail_chasing_opponent_distance: 6,
+                articulation_point_penalty: -2000,
+                articulation_point_enabled: true,
             },
             idapos: IdaposConfig {
-                head_distance_multiplier: 2,
+                head_distance_multiplier: 1,  // Aggressive locality masking: only snakes within depth distance
                 min_snakes_for_alpha_beta: 2,
             },
             move_ordering: MoveOrderingConfig {
@@ -379,7 +425,7 @@ mod tests {
     fn test_config_can_be_created() {
         let config = Config::default_hardcoded();
         assert_eq!(config.timing.initial_depth, 2);
-        assert_eq!(config.scores.weight_space, 10.0);
+        assert_eq!(config.scores.weight_space, 20.0);  // Updated to match Snake.toml
     }
 
     #[test]

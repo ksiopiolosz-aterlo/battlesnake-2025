@@ -231,6 +231,102 @@ enum ExecutionStrategy {
     ParallelMultiplayer,
 }
 
+/// Adaptive time estimation tracking empirical iteration times
+/// Uses exponential moving average to blend observed times with model predictions
+#[derive(Debug, Clone)]
+struct AdaptiveTimeEstimator {
+    /// Observed average time per depth level (index = depth, value = average time in ms)
+    depth_timings: Vec<f64>,
+    /// Number of observations per depth level for calculating running average
+    depth_observations: Vec<u32>,
+    /// Blending factor for combining empirical data with model predictions
+    /// 0.0 = pure empirical (100% observed data), 1.0 = pure model (100% formula)
+    model_weight: f64,
+    /// Fallback configuration for exponential model
+    base_time_ms: f64,
+    branching_factor: f64,
+}
+
+impl AdaptiveTimeEstimator {
+    /// Creates a new adaptive estimator with configuration parameters
+    fn new(base_time_ms: f64, branching_factor: f64, model_weight: f64) -> Self {
+        Self {
+            depth_timings: Vec::new(),
+            depth_observations: Vec::new(),
+            model_weight: model_weight.clamp(0.0, 1.0),
+            base_time_ms,
+            branching_factor,
+        }
+    }
+
+    /// Records an observed iteration time at a specific depth
+    fn record_observation(&mut self, depth: u8, elapsed_ms: f64) {
+        let depth_idx = depth as usize;
+
+        // Expand vectors if needed
+        while self.depth_timings.len() <= depth_idx {
+            self.depth_timings.push(0.0);
+            self.depth_observations.push(0);
+        }
+
+        // Update running average using incremental mean formula
+        let n = self.depth_observations[depth_idx] as f64;
+        let old_avg = self.depth_timings[depth_idx];
+        let new_avg = (old_avg * n + elapsed_ms) / (n + 1.0);
+
+        self.depth_timings[depth_idx] = new_avg;
+        self.depth_observations[depth_idx] += 1;
+    }
+
+    /// Estimates time for an iteration at a given depth
+    /// Blends empirical observations with exponential model
+    fn estimate(&self, depth: u8, num_snakes: usize) -> u64 {
+        let depth_idx = depth as usize;
+
+        // Calculate model prediction (exponential branching)
+        let exponent = (depth as f64) * (num_snakes as f64);
+        let model_estimate = self.base_time_ms * self.branching_factor.powf(exponent);
+
+        // If we have observations for this exact depth, blend with empirical data
+        if depth_idx < self.depth_timings.len() && self.depth_observations[depth_idx] > 0 {
+            let empirical_estimate = self.depth_timings[depth_idx];
+            let blended = self.model_weight * model_estimate
+                + (1.0 - self.model_weight) * empirical_estimate;
+            return blended.ceil() as u64;
+        }
+
+        // If we have observations for earlier depths, extrapolate using ratio
+        if let Some(last_observed_depth) = self.find_last_observed_depth(depth) {
+            let observed_time = self.depth_timings[last_observed_depth];
+
+            // Calculate expected ratio between depths using model
+            let depth_gap = depth - last_observed_depth as u8;
+            let exponent_gap = (depth_gap as f64) * (num_snakes as f64);
+            let ratio = self.branching_factor.powf(exponent_gap);
+
+            let extrapolated = observed_time * ratio;
+
+            // Blend extrapolation with pure model
+            let blended =
+                self.model_weight * model_estimate + (1.0 - self.model_weight) * extrapolated;
+            return blended.ceil() as u64;
+        }
+
+        // No observations yet - fall back to pure model
+        model_estimate.ceil() as u64
+    }
+
+    /// Finds the highest depth we have observations for, up to the given depth
+    fn find_last_observed_depth(&self, max_depth: u8) -> Option<usize> {
+        for depth in (0..=max_depth as usize).rev() {
+            if depth < self.depth_observations.len() && self.depth_observations[depth] > 0 {
+                return Some(depth);
+            }
+        }
+        None
+    }
+}
+
 /// Lock-free shared state for communication between async poller and computation engine
 #[derive(Debug)]
 pub struct SharedSearchState {
@@ -474,6 +570,7 @@ fn direction_to_index(dir: Direction) -> usize {
 /// 1. Head is adjacent to food (eating will change evaluation dramatically)
 /// 2. Opponent heads are nearby (head-to-head collision risk)
 /// 3. Health is critically low (starvation imminent)
+/// 4. **NEW: Trap detection - reachable space is critically low (entrapment risk)**
 fn is_position_unstable(board: &Board, our_snake_id: &str, config: &Config) -> bool {
     let our_snake = match board.snakes.iter().find(|s| &s.id == our_snake_id) {
         Some(s) if s.health > 0 => s,
@@ -511,6 +608,21 @@ fn is_position_unstable(board: &Board, our_snake_id: &str, config: &Config) -> b
                 return true; // Starvation risk with nearby food
             }
         }
+    }
+
+    // Check 4: Trap detection - critically low reachable space
+    // If we have very limited space, this is tactically critical (entrapment risk)
+    // Use a quick flood fill to check available space
+    let our_idx = board.snakes.iter().position(|s| &s.id == our_snake_id).unwrap_or(0);
+    let required_space = our_snake.length as usize + config.scores.space_safety_margin;
+    let critical_space_threshold = required_space + (required_space / 2);
+
+    // Use early exit optimization - stop counting once we know we have enough space
+    let reachable = Bot::flood_fill_bfs(board, our_head, our_idx, Some(critical_space_threshold + 1));
+
+    // If we're within 50% of minimum required space, consider it unstable (trap forming)
+    if reachable <= critical_space_threshold {
+        return true; // Trap risk - extend search to find escape route
     }
 
     false
@@ -780,6 +892,14 @@ impl Bot {
         // Get appropriate time estimation parameters based on number of alive snakes
         let time_params = config.time_estimation.for_snake_count(num_alive_snakes);
 
+        // Create adaptive time estimator for this search
+        // Starts with configured model parameters, adapts based on observed iteration times
+        let mut time_estimator = AdaptiveTimeEstimator::new(
+            time_params.base_iteration_time_ms,
+            time_params.branching_factor,
+            config.time_estimation.model_weight,
+        );
+
         let init_elapsed = init_start.elapsed().as_micros();
         if simple_profiler::is_profiling_enabled() {
             eprintln!("[PROFILE] Initialization: {}µs", init_elapsed);
@@ -817,16 +937,14 @@ impl Bot {
             let active_snakes = Self::determine_active_snakes(board, &you.id, current_depth, config);
             let num_active_snakes = active_snakes.len();
 
-            // Estimate time for next iteration using exponential model
-            // time = base_time * (branching_factor ^ (depth * num_snakes))
-            // Use IDAPOS-filtered count for accurate estimation
-            let exponent = (current_depth as f64) * (num_active_snakes as f64);
-            let estimated_time = (time_params.base_iteration_time_ms * time_params.branching_factor.powf(exponent)).ceil() as u64;
+            // Estimate time for next iteration using ADAPTIVE estimation
+            // Blends observed iteration times with exponential model for accurate predictions
+            // Adapts dynamically as code changes (move ordering, trap detection, etc.)
+            let estimated_time = time_estimator.estimate(current_depth, num_active_snakes);
 
             if simple_profiler::is_profiling_enabled() {
-                eprintln!("[PROFILE] Time estimation: depth={}, snakes_total={}, snakes_active={} (IDAPOS), exponent={:.2}, base={:.3}ms, factor={:.2}, estimated={}ms",
-                         current_depth, num_alive_snakes, num_active_snakes, exponent,
-                         time_params.base_iteration_time_ms, time_params.branching_factor, estimated_time);
+                eprintln!("[PROFILE] Time estimation: depth={}, snakes_total={}, snakes_active={} (IDAPOS), estimated={}ms (adaptive)",
+                         current_depth, num_alive_snakes, num_active_snakes, estimated_time);
             }
 
             if estimated_time > remaining {
@@ -921,6 +1039,10 @@ impl Bot {
 
             // Record actual iteration time
             let iteration_elapsed = iteration_start.elapsed().as_millis() as u64;
+
+            // Record observation for adaptive time estimation
+            // This teaches the estimator about actual iteration times, making future estimates more accurate
+            time_estimator.record_observation(current_depth, iteration_elapsed as f64);
 
             // Extract best move and score from this iteration
             let (best_move_idx, best_score) = shared.get_best();
@@ -1551,14 +1673,18 @@ impl Bot {
     ///
     /// If active_snakes is empty, processes all snakes.
     /// Otherwise, only processes snakes in the provided list (IDAPOS optimization).
-    fn adversarial_flood_fill(board: &Board, active_snakes: &[usize]) -> HashMap<Coord, usize> {
+    fn adversarial_flood_fill(board: &Board, active_snakes: &[usize]) -> Vec<Option<usize>> {
         let _prof = simple_profiler::ProfileGuard::new("adversarial_flood_fill");
 
-        let mut control_map: HashMap<Coord, usize> = HashMap::new();
-        let mut distance_map: HashMap<Coord, usize> = HashMap::new();
+        let size = (board.width * board.height as i32) as usize;
+        let mut control_map: Vec<Option<usize>> = vec![None; size];
+        let mut distance_map: Vec<Option<usize>> = vec![None; size];
 
         // Determine which snakes to process
         let process_all = active_snakes.is_empty();
+
+        // Helper to convert Coord to flat array index
+        let coord_to_idx = |c: &Coord| (c.y * board.width + c.x) as usize;
 
         // Mark snake bodies as obstacles controlled by their owner
         if process_all {
@@ -1567,7 +1693,7 @@ impl Bot {
                     continue;
                 }
                 for &seg in &snake.body {
-                    control_map.insert(seg, idx);
+                    control_map[coord_to_idx(&seg)] = Some(idx);
                 }
             }
         } else {
@@ -1580,7 +1706,7 @@ impl Bot {
                     continue;
                 }
                 for &seg in &snake.body {
-                    control_map.insert(seg, idx);
+                    control_map[coord_to_idx(&seg)] = Some(idx);
                 }
             }
         }
@@ -1606,21 +1732,26 @@ impl Bot {
         let mut queue = VecDeque::new();
         for (idx, snake) in snakes_sorted.iter() {
             if snake.health > 0 && !snake.body.is_empty() {
+                let head_idx = coord_to_idx(&snake.body[0]);
                 queue.push_back((snake.body[0], *idx, 0));
-                distance_map.insert(snake.body[0], 0);
+                distance_map[head_idx] = Some(0);
             }
         }
 
         while let Some((pos, owner, dist)) = queue.pop_front() {
+            let pos_idx = coord_to_idx(&pos);
+
             // Skip if already claimed by another snake at same or closer distance
-            if let Some(&existing_dist) = distance_map.get(&pos) {
+            if let Some(existing_dist) = distance_map[pos_idx] {
                 if existing_dist < dist {
                     continue;
                 }
             }
 
             // Claim cell if not already controlled
-            control_map.entry(pos).or_insert(owner);
+            if control_map[pos_idx].is_none() {
+                control_map[pos_idx] = Some(owner);
+            }
 
             for dir in Direction::all().iter() {
                 let next = dir.apply(&pos);
@@ -1633,16 +1764,17 @@ impl Bot {
                     continue;
                 }
 
+                let next_idx = coord_to_idx(&next);
                 let next_dist = dist + 1;
 
                 // Only explore if we can reach it faster (not equal distance - prevents re-exploration)
-                let should_explore = match distance_map.get(&next) {
-                    Some(&existing_dist) => next_dist < existing_dist,
+                let should_explore = match distance_map[next_idx] {
+                    Some(existing_dist) => next_dist < existing_dist,
                     None => true,
                 };
 
-                if should_explore && !control_map.contains_key(&next) {
-                    distance_map.insert(next, next_dist);
+                if should_explore && control_map[next_idx].is_none() {
+                    distance_map[next_idx] = Some(next_dist);
                     queue.push_back((next, owner, next_dist));
                 }
             }
@@ -1653,15 +1785,15 @@ impl Bot {
 
     /// Helper to compute control score from pre-computed map
     fn compute_control_score_from_map(
-        control_map: &HashMap<Coord, usize>,
+        control_map: &[Option<usize>],
         snake_idx: usize,
         config: &Config,
     ) -> i32 {
         let our_cells = control_map
-            .values()
-            .filter(|&&owner| owner == snake_idx)
+            .iter()
+            .filter(|cell| cell.map_or(false, |owner| owner == snake_idx))
             .count();
-        let total_free = control_map.len();
+        let total_free = control_map.iter().filter(|cell| cell.is_some()).count();
 
         if total_free == 0 {
             return 0;
@@ -1698,6 +1830,52 @@ impl Bot {
             .map(|&food| manhattan_distance(head, food))
             .min()
             .unwrap_or(config.scores.default_food_distance);
+
+        // Immediate food bonus: strongly incentivize grabbing adjacent food
+        // This overrides normal distance penalty to ensure we eat when safe
+        // V6 fix: Check escape routes before eating food to avoid "grab and die" pattern
+        if nearest_food_dist <= config.scores.immediate_food_distance && snake.health < 100 {
+            // Find the nearest food position
+            let nearest_food = board
+                .food
+                .iter()
+                .min_by_key(|&food| manhattan_distance(head, *food))
+                .copied();
+
+            // Check escape routes after eating this food
+            if let Some(food_pos) = nearest_food {
+                let escape_routes = Self::count_escape_routes_after_eating(board, snake_idx, food_pos);
+
+                // If we'd have insufficient escape routes after eating, penalize
+                // V7: Scale penalty by health urgency (lower health = more willing to risk)
+                if escape_routes < config.scores.escape_route_min {
+                    let penalty = if config.scores.escape_route_penalty_health_scale {
+                        let health_urgency = (100.0 - snake.health as f32) / 100.0;
+                        // At low health (0-30): penalty *= 0.5 (more aggressive)
+                        // At high health (70-100): penalty *= 1.0 (more conservative)
+                        (config.scores.escape_route_penalty_base as f32 * (0.5 + health_urgency * 0.5)) as i32
+                    } else {
+                        config.scores.escape_route_penalty_base
+                    };
+
+                    // V7: Add safe food bonus for central food
+                    let center_x = (board.width / 2) as i32;
+                    let center_y = (board.height / 2) as i32;
+                    let center = Coord { x: center_x, y: center_y };
+                    let dist_from_center = manhattan_distance(food_pos, center);
+
+                    let safe_food_bonus = if dist_from_center <= config.scores.safe_food_center_threshold {
+                        config.scores.safe_food_bonus
+                    } else {
+                        0
+                    };
+
+                    return config.scores.immediate_food_bonus + penalty + safe_food_bonus;
+                }
+            }
+
+            return config.scores.immediate_food_bonus;
+        }
 
         // Urgency increases as health decreases
         // Length-aware: longer snakes need to plan further ahead (more body to navigate)
@@ -1877,18 +2055,7 @@ impl Bot {
         }
 
         let control_map = Self::adversarial_flood_fill(board, &[]);
-
-        let our_cells = control_map
-            .values()
-            .filter(|&&owner| owner == snake_idx)
-            .count();
-        let total_free = control_map.len();
-
-        if total_free == 0 {
-            return 0;
-        }
-
-        ((our_cells as f32 / total_free as f32) * config.scores.territory_scale_factor) as i32
+        Self::compute_control_score_from_map(&control_map, snake_idx, config)
     }
 
     /// Computes attack potential score
@@ -2001,9 +2168,10 @@ impl Bot {
 
     /// Computes wall proximity penalty to discourage moves toward boundaries
     /// Uses formula: penalty = -wall_penalty_base / (distance + 1)
-    /// Examples: distance=0 → -10000, distance=1 → -5000, distance=2 → -3333
+    /// Health-aware: scales penalty down when health is low to allow edge food acquisition
+    /// Examples (at full health): distance=0 → -500, distance=1 → -250, distance=2 → -167
     /// Caps at distance >= 3 (safe distance)
-    fn compute_wall_penalty(pos: Coord, width: i32, height: i32, config: &Config) -> i32 {
+    fn compute_wall_penalty(pos: Coord, width: i32, height: i32, health: i32, config: &Config) -> i32 {
         let dist_to_wall = [
             pos.x,                  // distance to left wall
             width - 1 - pos.x,      // distance to right wall
@@ -2020,9 +2188,17 @@ impl Bot {
             return 0;
         }
 
-        // Apply mathematical formula for smooth gradient
-        // Penalty decreases as distance increases
-        -(config.scores.wall_penalty_base / (dist_to_wall + 1))
+        // Health-aware scaling: reduce penalty when hungry to allow edge food acquisition
+        let health_factor = if health < 30 {
+            0.5  // 50% penalty when health < 30
+        } else if health < 60 {
+            0.75  // 75% penalty when health < 60
+        } else {
+            1.0  // Full penalty when healthy
+        };
+
+        let base_penalty = config.scores.wall_penalty_base as f32 * health_factor;
+        -(base_penalty / (dist_to_wall + 1) as f32) as i32
     }
 
     /// Computes center bias to encourage staying in central board positions
@@ -2035,6 +2211,375 @@ impl Bot {
         // Prefer central positions
         // Center = +100, edges = 0 or negative
         100 - (dist_from_center * config.scores.center_bias_multiplier)
+    }
+
+    /// Computes corner danger penalty - exponential penalty as snake approaches corners
+    /// V5 fix: Game 03 died at (10,10) after eating corner food - need to avoid corners
+    fn compute_corner_danger(pos: Coord, width: i32, height: i32, config: &Config) -> i32 {
+        // Distance to nearest corner
+        let corners = [
+            (0, 0),
+            (0, height - 1),
+            (width - 1, 0),
+            (width - 1, height - 1),
+        ];
+
+        let min_corner_dist = corners
+            .iter()
+            .map(|&(cx, cy)| (pos.x - cx).abs() + (pos.y - cy).abs())
+            .min()
+            .unwrap_or(999);
+
+        // Apply exponential penalty when within threshold
+        if min_corner_dist <= config.scores.corner_danger_threshold {
+            // Exponential: at corner (0) = -5000, at distance 1 = -2500, at distance 2 = -1667, at distance 3 = -1250
+            -(config.scores.corner_danger_base / (min_corner_dist + 1))
+        } else {
+            0
+        }
+    }
+
+    /// Counts escape routes (legal moves) after eating food at a position
+    /// V6 fix: Prevents "grab food and die" pattern from V5 Game 03
+    fn count_escape_routes_after_eating(board: &Board, snake_idx: usize, food_pos: Coord) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let snake = &board.snakes[snake_idx];
+        if snake.body.is_empty() {
+            return 0;
+        }
+
+        // Simulate eating the food: head moves to food_pos, body grows
+        let new_head = food_pos;
+        let mut new_body = vec![new_head];
+        new_body.extend_from_slice(&snake.body);
+        // Body grows when eating food (don't remove tail)
+
+        // Count legal moves from the new position
+        let directions = [
+            Direction::Up,
+            Direction::Down,
+            Direction::Left,
+            Direction::Right,
+        ];
+
+        let mut legal_moves = 0;
+        for dir in &directions {
+            let next_pos = match dir {
+                Direction::Up => Coord {
+                    x: new_head.x,
+                    y: new_head.y + 1,
+                },
+                Direction::Down => Coord {
+                    x: new_head.x,
+                    y: new_head.y - 1,
+                },
+                Direction::Left => Coord {
+                    x: new_head.x - 1,
+                    y: new_head.y,
+                },
+                Direction::Right => Coord {
+                    x: new_head.x + 1,
+                    y: new_head.y,
+                },
+            };
+
+            // Check bounds
+            if next_pos.x < 0
+                || next_pos.x >= board.width as i32
+                || next_pos.y < 0
+                || next_pos.y >= board.height as i32
+            {
+                continue;
+            }
+
+            // Check if we'd hit our new body (excluding tail which will move)
+            let body_collision = new_body
+                .iter()
+                .take(new_body.len().saturating_sub(1)) // Exclude tail
+                .any(|&segment| segment == next_pos);
+
+            if body_collision {
+                continue;
+            }
+
+            // Check if we'd hit other snakes (excluding their tails)
+            let mut other_collision = false;
+            for (idx, other_snake) in board.snakes.iter().enumerate() {
+                if idx == snake_idx || other_snake.health == 0 {
+                    continue;
+                }
+
+                let other_body_check = &other_snake.body[..other_snake.body.len().saturating_sub(1)];
+                if other_body_check.contains(&next_pos) {
+                    other_collision = true;
+                    break;
+                }
+            }
+
+            if other_collision {
+                continue;
+            }
+
+            // This move is legal
+            legal_moves += 1;
+        }
+
+        legal_moves
+    }
+
+    /// Computes length advantage bonus to encourage growth
+    /// V5 fix: Bot stayed small (length 6) while opponents grew (length 19)
+    fn compute_length_advantage(board: &Board, snake_idx: usize, config: &Config) -> i32 {
+        let our_length = board.snakes[snake_idx].length;
+
+        // Get opponent lengths (alive snakes only, excluding ourselves)
+        let opponent_lengths: Vec<i32> = board
+            .snakes
+            .iter()
+            .enumerate()
+            .filter(|(idx, s)| *idx != snake_idx && s.health > 0)
+            .map(|(_, s)| s.length)
+            .collect();
+
+        if opponent_lengths.is_empty() {
+            return 0; // No opponents, no bonus
+        }
+
+        // Calculate median opponent length
+        let mut sorted_lengths = opponent_lengths.clone();
+        sorted_lengths.sort_unstable();
+        let median_length = if sorted_lengths.len() % 2 == 0 {
+            (sorted_lengths[sorted_lengths.len() / 2 - 1] + sorted_lengths[sorted_lengths.len() / 2]) / 2
+        } else {
+            sorted_lengths[sorted_lengths.len() / 2]
+        };
+
+        // Bonus for being longer than median, penalty for being shorter
+        let length_diff = our_length - median_length;
+        length_diff * config.scores.length_advantage_bonus
+    }
+
+    /// V7: Detects tail-chasing pattern (body segments clustering near head)
+    /// NUANCED: Only applies penalty when opponents are nearby (indicating active trap risk)
+    /// Prevents self-trapping but allows tail-chasing as valid survival tactic when isolated
+    /// Uses IDAPOS-filtered active_snakes to check for nearby opponents
+    fn compute_tail_chasing_penalty(
+        board: &Board,
+        snake_idx: usize,
+        active_snakes: &[usize],
+        config: &Config,
+    ) -> i32 {
+        if snake_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let snake = &board.snakes[snake_idx];
+        if snake.body.len() < 4 {
+            return 0; // Need minimum length to form a loop
+        }
+
+        let head = snake.body[0];
+
+        // NUANCE: Check if any active opponent is nearby (IDAPOS-filtered)
+        // If no opponents nearby, tail-chasing is a valid survival tactic (doesn't risk trap)
+        let has_nearby_opponent = active_snakes
+            .iter()
+            .filter(|&&idx| idx != snake_idx && idx < board.snakes.len())
+            .any(|&idx| {
+                let opponent = &board.snakes[idx];
+                if opponent.health <= 0 || opponent.body.is_empty() {
+                    return false;
+                }
+                let opp_head = opponent.body[0];
+                manhattan_distance(head, opp_head) <= config.scores.tail_chasing_opponent_distance
+            });
+
+        // If no opponents nearby, tail-chasing is safe (no penalty)
+        if !has_nearby_opponent {
+            return 0;
+        }
+
+        // Count body segments within detection distance of head (excluding neck)
+        let nearby_segments = snake.body[2..]
+            .iter()
+            .filter(|&&seg| {
+                manhattan_distance(head, seg) <= config.scores.tail_chasing_detection_distance
+            })
+            .count();
+
+        if nearby_segments == 0 {
+            return 0;
+        }
+
+        // Exponential penalty: more nearby segments = tighter loop = higher risk
+        let penalty_base = nearby_segments as f32;
+        let penalty = penalty_base.powf(config.scores.tail_chasing_penalty_exponent)
+            * config.scores.tail_chasing_penalty_per_segment as f32;
+
+        -(penalty as i32)
+    }
+
+    /// Helper: Flood fill that returns HashSet of reachable positions
+    /// Uses IDAPOS-filtered active snakes for collision detection (consistent with space control)
+    fn flood_fill_for_articulation(
+        board: &Board,
+        start: Coord,
+        snake_idx: usize,
+        active_snakes: &[usize],
+    ) -> HashSet<Coord> {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        queue.push_back(start);
+        visited.insert(start);
+
+        while let Some(pos) = queue.pop_front() {
+            for &dir in &[Direction::Up, Direction::Down, Direction::Left, Direction::Right] {
+                let next = match dir {
+                    Direction::Up => Coord { x: pos.x, y: pos.y + 1 },
+                    Direction::Down => Coord { x: pos.x, y: pos.y - 1 },
+                    Direction::Left => Coord { x: pos.x - 1, y: pos.y },
+                    Direction::Right => Coord { x: pos.x + 1, y: pos.y },
+                };
+
+                // Check bounds
+                if next.x < 0 || next.x >= board.width as i32 ||
+                   next.y < 0 || next.y >= board.height as i32 {
+                    continue;
+                }
+
+                if visited.contains(&next) {
+                    continue;
+                }
+
+                // IDAPOS: Only check collision with active (nearby) snakes
+                let blocked = active_snakes.iter().any(|&idx| {
+                    if idx >= board.snakes.len() {
+                        return false;
+                    }
+                    let snake = &board.snakes[idx];
+                    snake.health > 0 && snake.body.contains(&next)
+                });
+
+                if !blocked {
+                    visited.insert(next);
+                    queue.push_back(next);
+                }
+            }
+        }
+
+        visited
+    }
+
+    /// V7: Detects articulation points in reachable space
+    /// Articulation points are positions whose removal would disconnect the space
+    /// These are narrow passages that create high trap risk
+    /// Uses IDAPOS-filtered active_snakes for efficient collision detection
+    fn compute_articulation_point_penalty(
+        board: &Board,
+        snake_idx: usize,
+        active_snakes: &[usize],
+        config: &Config,
+    ) -> i32 {
+        if !config.scores.articulation_point_enabled {
+            return 0;
+        }
+
+        if snake_idx >= board.snakes.len() {
+            return 0;
+        }
+
+        let snake = &board.snakes[snake_idx];
+        if snake.body.is_empty() {
+            return 0;
+        }
+
+        let head = snake.body[0];
+
+        // Flood fill to get reachable space (returns HashSet)
+        // Uses IDAPOS-filtered snakes for collision checks
+        let reachable = Self::flood_fill_for_articulation(board, head, snake_idx, active_snakes);
+
+        if reachable.len() < 4 {
+            return 0; // Too small to have meaningful articulation points
+        }
+
+        // Check if current head position is an articulation point
+        // Method: Remove head from reachable set and check connectivity
+        let is_articulation = Self::is_articulation_point(head, &reachable);
+
+        if is_articulation {
+            config.scores.articulation_point_penalty
+        } else {
+            0
+        }
+    }
+
+    /// Helper: Check if a position is an articulation point
+    fn is_articulation_point(
+        pos: Coord,
+        reachable: &HashSet<Coord>,
+    ) -> bool {
+        // Get neighbors that are in reachable set
+        let neighbors: Vec<Coord> = [
+            Direction::Up,
+            Direction::Down,
+            Direction::Left,
+            Direction::Right,
+        ]
+        .iter()
+        .filter_map(|&dir| {
+            let next = match dir {
+                Direction::Up => Coord { x: pos.x, y: pos.y + 1 },
+                Direction::Down => Coord { x: pos.x, y: pos.y - 1 },
+                Direction::Left => Coord { x: pos.x - 1, y: pos.y },
+                Direction::Right => Coord { x: pos.x + 1, y: pos.y },
+            };
+            if reachable.contains(&next) && next != pos {
+                Some(next)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+        if neighbors.len() < 2 {
+            return false; // Not enough neighbors to be articulation point
+        }
+
+        // Check if removing this position disconnects the neighbors
+        // Do BFS from first neighbor without going through pos
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(neighbors[0]);
+        visited.insert(neighbors[0]);
+        visited.insert(pos); // Block the articulation point candidate
+
+        while let Some(current) = queue.pop_front() {
+            for &dir in &[
+                Direction::Up,
+                Direction::Down,
+                Direction::Left,
+                Direction::Right,
+            ] {
+                let next = match dir {
+                    Direction::Up => Coord { x: current.x, y: current.y + 1 },
+                    Direction::Down => Coord { x: current.x, y: current.y - 1 },
+                    Direction::Left => Coord { x: current.x - 1, y: current.y },
+                    Direction::Right => Coord { x: current.x + 1, y: current.y },
+                };
+                if reachable.contains(&next) && !visited.contains(&next) {
+                    visited.insert(next);
+                    queue.push_back(next);
+                }
+            }
+        }
+
+        // If not all neighbors are reachable, pos is an articulation point
+        neighbors.iter().any(|n| !visited.contains(n))
     }
 
     /// Evaluates the current game state for all snakes
@@ -2128,15 +2673,37 @@ impl Bot {
                 0
             };
 
-            // Wall proximity penalty and center bias
-            let (wall_penalty, center_bias) = if !snake.body.is_empty() {
+            // Wall proximity penalty, center bias, and corner danger
+            let (wall_penalty, center_bias, corner_danger) = if !snake.body.is_empty() {
                 let head = snake.body[0];
                 (
-                    Self::compute_wall_penalty(head, board.width as i32, board.height as i32, config),
+                    Self::compute_wall_penalty(head, board.width as i32, board.height as i32, snake.health, config),
                     Self::compute_center_bias(head, board.width as i32, board.height as i32, config),
+                    Self::compute_corner_danger(head, board.width as i32, board.height as i32, config),
                 )
             } else {
-                (0, 0)
+                (0, 0, 0)
+            };
+
+            // Length advantage bonus
+            let length_advantage = Self::compute_length_advantage(board, idx, config);
+
+            // V7: Tail-chasing detection (nuanced - only when opponents nearby)
+            // Uses IDAPOS-filtered active snakes to check for nearby opponents
+            let tail_chasing_penalty = if is_active {
+                let active_list = active_snakes.unwrap_or(&[]);
+                Self::compute_tail_chasing_penalty(board, idx, active_list, config)
+            } else {
+                0  // Skip tail-chasing check for non-active snakes
+            };
+
+            // V7: Articulation point detection (narrow passage risk)
+            // Uses IDAPOS-filtered active snakes for efficient collision detection
+            let articulation_penalty = if is_active {
+                let active_list = active_snakes.unwrap_or(&[]);
+                Self::compute_articulation_point_penalty(board, idx, active_list, config)
+            } else {
+                0  // Skip expensive articulation check for non-active snakes
             };
 
             // Weighted combination
@@ -2149,7 +2716,11 @@ impl Bot {
                 + length
                 + head_collision_danger
                 + wall_penalty
-                + center_bias;
+                + center_bias
+                + corner_danger
+                + length_advantage
+                + tail_chasing_penalty
+                + articulation_penalty;
         }
 
         // Apply survival penalty if our snake is dead
@@ -2875,7 +3446,7 @@ impl Bot {
         let (wall_penalty, center_bias) = if !test_board.snakes[our_idx].body.is_empty() {
             let h = test_board.snakes[our_idx].body[0];
             (
-                Self::compute_wall_penalty(h, test_board.width as i32, test_board.height as i32, config),
+                Self::compute_wall_penalty(h, test_board.width as i32, test_board.height as i32, test_board.snakes[our_idx].health, config),
                 Self::compute_center_bias(h, test_board.width as i32, test_board.height as i32, config),
             )
         } else {

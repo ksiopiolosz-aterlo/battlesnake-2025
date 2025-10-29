@@ -46,27 +46,40 @@ window_expansion_multiplier = 3
 # Separate parameters for 1v1 and multiplayer (battle royale) scenarios
 # These are automatically selected based on number of alive snakes
 
+[time_estimation]
+# Adaptive Time Estimation Blending Factor
+# 0.0 = pure empirical (100% observed), 1.0 = pure model (100% formula)
+# Reduced from 0.4 to 0.1 based on v3 analysis showing model overestimates complexity
+# Analysis showed: depth 6 estimated 345ms but actual 7ms (49x overestimate)
+# At 0.1 (10% model, 90% empirical): provides safety buffer without excessive conservatism
+model_weight = 0.1
+
 [time_estimation.one_vs_one]
 # Base time for iteration estimation in milliseconds
 base_iteration_time_ms = 0.01
 # Exponential branching factor for time estimation
-# Tuned with move ordering: 2.75 achieves depth 5.76 with 0% timeouts (100ms avg)
-# Previous: 3.25 → depth 4.4 with underutilized time budget
-# Move ordering enables more efficient search, allowing lower branching factor
-# Dataset: tests/fixtures/1v1_scared_bot/ (178 turns, 7 games)
-branching_factor = 2.75
+# Tuned with move ordering: 2.2 achieves depth 7+ with <5% timeouts
+# Previous: 2.75 → depth 5.76 (underutilized time budget)
+# Previous: 3.25 → depth 4.4 (underutilized time budget)
+# Move ordering + aspiration windows enable efficient search
+# Dataset: tests/fixtures/optimized_v1/ analysis shows ~80% unused budget at 2.75
+branching_factor = 2.2
 
 [time_estimation.multiplayer]
 # Base time for iteration estimation in milliseconds
 base_iteration_time_ms = 0.01
 # Exponential branching factor for time estimation
-# Reduced from 3.5 to 2.25 to enable deeper search in battle royale
-# IDAPOS locality masking means only 1-2 snakes are active at shallow depths
-# With branching_factor=2.25:
-#   Depth 2: 0.01 * 2.25^(2*4) = 0.01 * 2.25^8 ≈ 169ms ✓
-#   Depth 3: 0.01 * 2.25^(3*4) = 0.01 * 2.25^12 ≈ 8566ms ✗
-# This allows depth 2-3 search reliably
-branching_factor = 2.25
+# Reduced from 1.6 to 1.2 based on v3 analysis showing severe overestimation
+# V3 analysis with branching_factor=1.6 showed:
+#   - Depth 5-6 average (stopped with 200+ms unused)
+#   - Estimator predicted depth 6 = 345ms, actual = 7ms (49x overestimate!)
+#   - 100% death by entrapment (need depth 8-10 to see traps forming)
+# With branching_factor=1.2 and IDAPOS-filtered 1-2 active snakes:
+#   Depth 8: 0.01 * 1.2^(8*2) = 0.01 * 1.2^16 ≈ 79ms ✓
+#   Depth 9: 0.01 * 1.2^(9*2) = 0.01 * 1.2^18 ≈ 114ms ✓
+#   Depth 10: 0.01 * 1.2^(10*2) = 0.01 * 1.2^20 ≈ 164ms ✓
+# Lower branching factor enables deeper search within time budget
+branching_factor = 1.2
 
 # ============================================================================
 # Strategy Selection Constants
@@ -92,16 +105,23 @@ score_survival_weight = 1000.0
 
 # Component Weights
 # Weight for space control score
-# Increased from 10.0 to 20.0 to better avoid getting trapped
-weight_space = 20.0
+# Reduced from 30.0 to 25.0 to better balance with food acquisition
+# V4 analysis showed wall/space penalties overwhelming food needs at edges
+# At 25.0: balanced with health weight for better decision-making
+weight_space = 25.0
 # Weight for health/food score
-# Increased from 5.0 to 20.0 to prioritize food when health is low
-# Matches space weight so bot balances survival (space) with starvation prevention (health)
-weight_health = 20.0
+# Increased from 50.0 to 75.0 based on v4 food acquisition bug
+# V4 game_02 turn 17: adjacent food ignored due to wall/space penalties
+# At 75.0: food acquisition dominates when health < 50, allowing edge feeding
+weight_health = 75.0
 # Weight for territory control score
 weight_control = 3.0
 # Weight for attack potential score
-weight_attack = 2.0
+# Increased from 2.0 to 10.0 to make kill opportunities competitive with space control
+# Analysis: attack bonuses of +500 (head-to-head + trap) need 10x multiplier to overcome
+# space control differences (space_delta × 20.0). At 10.0, trapped opponent scenarios
+# generate +5000 attack score, dominating defensive space gains.
+weight_attack = 10.0
 # Weight per unit of snake length
 weight_length = 100
 
@@ -116,6 +136,12 @@ health_max = 100.0
 score_starvation_base = -50000
 # Distance threshold for health threat detection
 health_threat_distance = 3
+# Immediate food bonus - overrides distance penalty for adjacent food
+# V4 fix: strongly incentivize grabbing food at distance 1 when safe
+# V6 analysis: Game 05 died turn 25 from avoiding safe center food at distance 2
+# Extended from distance 1 to 2 to apply bonus for nearby food (not just adjacent)
+immediate_food_bonus = 5000
+immediate_food_distance = 2
 
 # Space Control Constants
 # Extra cells needed beyond snake length
@@ -131,11 +157,15 @@ territory_scale_factor = 100.0
 # Max distance for head-to-head bonus
 attack_head_to_head_distance = 3
 # Bonus for length advantage near opponent
-attack_head_to_head_bonus = 50
+# Increased from 50 to 200 to strongly incentivize favorable head-to-head collisions
+# When bot is longer and opponent is trapped, this bonus should dominate defensive considerations
+attack_head_to_head_bonus = 200
 # Space margin to detect trapped opponent
 attack_trap_margin = 3
 # Bonus for trapping opponent
-attack_trap_bonus = 100
+# Increased from 100 to 300 to strongly reward scenarios where opponent has limited escape
+# Combined with head-to-head bonus: (200 + 300) × 10.0 = +5000 total attack score
+attack_trap_bonus = 300
 
 # Head-to-Head Collision Avoidance
 # Strong penalty for positions where we could collide head-to-head with equal/longer opponent
@@ -145,14 +175,42 @@ head_collision_penalty = -50000
 
 # Wall Proximity Penalty
 # Formula: penalty = -wall_penalty_base / (distance + 1) if distance < safe_distance_from_wall, else 0
-# Examples (at 1000): distance=0 → -1000, distance=1 → -500, distance=2 → -333, distance≥3 → 0
-# Reduced from 10000 to 1000 to prevent wall avoidance from dominating all other strategic considerations
-wall_penalty_base = 1000             # Base penalty value (divided by distance + 1)
+# Examples (at 500): distance=0 → -500, distance=1 → -250, distance=2 → -167, distance≥3 → 0
+# Reduced from 1000 to 500 to allow food acquisition near walls when health demands it
+# V4 analysis: wall penalty was preventing adjacent food consumption at board edges
+wall_penalty_base = 500              # Base penalty value (divided by distance + 1)
 safe_distance_from_wall = 3          # Distance at which wall penalty becomes 0
 
 # Center Bias
 # Encourages staying near center to maximize escape routes
-center_bias_multiplier = 10          # Distance multiplier for center bias calculation
+# V5 analysis: increased from 10 to 50 to prevent wall-hugging behavior
+# Game 03 death: bot stayed along top wall and got trapped after eating corner food
+center_bias_multiplier = 50          # Distance multiplier for center bias calculation
+
+# Corner Danger Penalty
+# V5 analysis: Game 03 died at corner (10,10) after eating food there
+# Exponential penalty as snake approaches corners to prevent entrapment
+corner_danger_base = 5000            # Base penalty applied at corner
+corner_danger_threshold = 3          # Distance threshold from corner to apply penalty
+
+# Escape Route Evaluation
+# V5 fix: Prevent "grab food and die" pattern from Game 03
+# V6 analysis: Penalty too aggressive (-3000) caused safe food avoidance in Game 05
+# Reduced to -1500 and added health scaling to balance food acquisition vs safety
+escape_route_penalty_base = -1500         # Base penalty when escape routes < minimum
+escape_route_penalty_health_scale = true  # Scale penalty by health urgency (lower health = lower penalty)
+escape_route_min = 2                      # Minimum escape routes required after eating food
+
+# Safe Food Bonus
+# V6 analysis: Game 05 avoided food at center (5,5) due to penalty stacking
+# Bonus for food at safe central positions to overcome conservative penalties
+safe_food_bonus = 2000                    # Bonus for food in safe central area
+safe_food_center_threshold = 3            # Manhattan distance from center to qualify as "safe central"
+
+# Length Advantage Bonus
+# V5 analysis: Bot stayed small (length 6) while opponents grew (length 19)
+# Incentivize growth to match or exceed opponent sizes
+length_advantage_bonus = 200         # Bonus per length unit above median opponent length
 
 # Length-Aware Health/Food Constants
 # Base snake length for urgency calculation (snakes shorter than this have urgency 1.0x)
@@ -185,6 +243,21 @@ adversarial_entrapment_distance = 3
 adversarial_space_reduction_penalty = 10000
 # Minimum space reduction percentage to trigger penalty (0.2 = 20%)
 adversarial_space_reduction_threshold = 0.2
+
+# Tail-Chasing Detection
+# V6 analysis: Games 01 & 03 died from creating tight body loops (self-traps)
+# Penalty for body segments clustering near head to prevent self-entrapment
+# NUANCED: Only apply when opponents are nearby (indicating active entrapment risk)
+tail_chasing_detection_distance = 2     # Manhattan distance to consider body segment "near head"
+tail_chasing_penalty_per_segment = 300  # Penalty per nearby body segment
+tail_chasing_penalty_exponent = 2.0     # Exponential scaling (nearby_count^exponent)
+tail_chasing_opponent_distance = 6      # Only apply penalty if opponent within this distance
+
+# Articulation Point Detection
+# Identifies critical positions whose removal would disconnect our reachable space
+# High penalty for moves that create articulation points (narrow passageways)
+articulation_point_penalty = -2000      # Penalty for positions that are articulation points
+articulation_point_enabled = true       # Enable/disable articulation point detection
 
 # ============================================================================
 # IDAPOS (Locality Masking) Constants
@@ -249,7 +322,7 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "balanced.jsonl"
+log_file_path = "optimized_v7.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration
