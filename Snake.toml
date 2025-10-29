@@ -359,7 +359,7 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "optimized_v10.jsonl"
+log_file_path = "optimized_v10.1.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration

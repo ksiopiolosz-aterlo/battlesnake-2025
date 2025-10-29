@@ -1930,7 +1930,7 @@ impl Bot {
                     .min()
                     .unwrap_or(999);
 
-                // V10: More aggressive at critical health
+                // V10.1: More aggressive at all health levels to prevent early game disadvantage
                 if snake.health < 30 {
                     // Critical health (<30): ALWAYS use max multiplier for distance-2 food
                     config.scores.survival_max_multiplier
@@ -1942,12 +1942,24 @@ impl Bot {
                         // Moderate multiplier when contested
                         config.scores.survival_max_multiplier * 0.6
                     }
-                } else if nearest_opponent_dist >= nearest_food_dist + 3 {
-                    // High health but clear advantage: use high multiplier
-                    config.scores.survival_max_multiplier * 0.8
+                } else if snake.health < 70 {
+                    // Moderate health (50-70): More aggressive to maintain size advantage
+                    if nearest_opponent_dist >= nearest_food_dist + 2 {
+                        // 2+ move advantage: good multiplier
+                        config.scores.survival_max_multiplier * 0.6
+                    } else {
+                        // Contested: conservative
+                        config.scores.survival_max_multiplier * 0.2
+                    }
                 } else {
-                    // Contested: moderate multiplier
-                    config.scores.survival_max_multiplier * 0.2
+                    // High health (>70): Early game growth priority
+                    if nearest_opponent_dist >= nearest_food_dist + 2 {
+                        // 2+ move advantage: prioritize growth (lowered from 3+ requirement)
+                        config.scores.survival_max_multiplier * 0.8
+                    } else {
+                        // Contested: still pursue with modest multiplier (increased from 0.2)
+                        config.scores.survival_max_multiplier * 0.3
+                    }
                 }
             } else {
                 // Distance 3+: More conservative, but still reward clear advantages
@@ -1965,13 +1977,25 @@ impl Bot {
                     .min()
                     .unwrap_or(999);
 
-                // V9.1.2: Increased multipliers for distant food with clear advantage
+                // V10.1: Increased multipliers for distant food, especially early game
                 // At critical health (<30), pursue any nearby food
                 if snake.health < 30 && nearest_food_dist <= 4 {
                     // Desperate: pursue distance 3-4 food at critical health
                     config.scores.survival_max_multiplier * 0.5
+                } else if snake.health > 70 {
+                    // Early game (high health): prioritize growth even for distant food
+                    if nearest_opponent_dist >= nearest_food_dist + 3 {
+                        // Clear 3+ advantage: strong multiplier for growth
+                        config.scores.survival_max_multiplier * 0.5
+                    } else if nearest_opponent_dist >= nearest_food_dist + 2 {
+                        // Small 2+ advantage: moderate multiplier
+                        config.scores.survival_max_multiplier * 0.2
+                    } else {
+                        // Contested: minimal multiplier
+                        1.0
+                    }
                 } else if nearest_opponent_dist >= nearest_food_dist + 4 {
-                    // Clear 4+ move advantage: use moderate multiplier (was 0.1x, now 0.4x)
+                    // Clear 4+ move advantage: use moderate multiplier
                     config.scores.survival_max_multiplier * 0.4
                 } else if nearest_opponent_dist >= nearest_food_dist + 2 {
                     // Small 2+ move advantage: use low multiplier

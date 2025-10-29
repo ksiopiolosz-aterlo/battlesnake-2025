@@ -89,7 +89,8 @@
       "Bash(./target/release/detect_cycling:*)",
       "Bash(./target/release/analyze_food_pursuit:*)",
       "Bash(./target/release/analyze_board_state:*)",
-      "Bash(./target/release/show_turn_details:*)"
+      "Bash(./target/release/show_turn_details:*)",
+      "Bash(xargs:*)"
     ],
     "deny": [],
     "ask": []
