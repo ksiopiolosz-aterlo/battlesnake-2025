@@ -2341,6 +2341,9 @@ impl Bot {
 
         // Parallel evaluation of root moves
         legal_moves.par_iter().enumerate().for_each(|(_idx, &mv)| {
+            // Each thread needs its own killers table (can't share mutable refs across threads)
+            let mut local_killers = KillerMoveTable::new(config);
+
             let mut child_board = board.clone();
             Self::apply_move(&mut child_board, our_idx, mv, config);
 
@@ -2351,6 +2354,7 @@ impl Bot {
                 our_idx,
                 config,
                 tt,
+                &mut local_killers,
             );
             let our_score = tuple.for_player(our_idx);
 
