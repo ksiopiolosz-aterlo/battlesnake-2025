@@ -167,7 +167,8 @@ health_threat_distance = 3
 # V4 fix: strongly incentivize grabbing food at distance 1 when safe
 # V6 analysis: Game 05 died turn 25 from avoiding safe center food at distance 2
 # Extended from distance 1 to 2 to apply bonus for nearby food (not just adjacent)
-immediate_food_bonus = 5000
+# V9.1.1: MASSIVELY increased to 500K to overcome any other penalties
+immediate_food_bonus = 500000
 immediate_food_distance = 2
 
 # Space Control Constants
@@ -354,7 +355,7 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "optimized_v9.jsonl"
+log_file_path = "optimized_v9.1.1.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration

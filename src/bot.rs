@@ -1905,23 +1905,61 @@ impl Bot {
             // survival_max_multiplier (default 1000.0) ensures survival layer dominates tactical,
             // but safety vetoes can still block dangerous moves
             // V8.1: Apply max multiplier when we just ate food (health==100) to reward acquisition
+            // V9.1: Distance-based damping with opponent awareness
             let urgency_multiplier = if just_ate_food {
                 // Just ate food - strongly reward this state!
                 config.scores.survival_max_multiplier
-            } else if nearest_food_dist == 1 && is_food_safe {
-                // Adjacent safe food - use urgency based on health threshold
-                if snake.health < config.scores.survival_health_threshold as i32 {
-                    // CRITICAL survival mode: max multiplier
-                    config.scores.survival_max_multiplier
-                } else if snake.health < 70 {
-                    // Moderate urgency: 10% of max
-                    config.scores.survival_max_multiplier * 0.1
+            } else if nearest_food_dist == 1 {
+                // Adjacent food - ALWAYS use max multiplier for distance-1 food
+                // The cycling bug was caused by not valuing adjacent food highly enough
+                // Even at high health, eating safe adjacent food should be strongly preferred
+                config.scores.survival_max_multiplier
+            } else if nearest_food_dist == 2 {
+                // Distance 2: Check if we have clear advantage
+                let nearest_opponent_dist = active_snakes.iter()
+                    .filter_map(|&opp_idx| {
+                        if opp_idx == snake_idx || opp_idx >= board.snakes.len() {
+                            return None;
+                        }
+                        let opp = &board.snakes[opp_idx];
+                        if opp.health <= 0 || opp.body.is_empty() {
+                            return None;
+                        }
+                        nearest_food.map(|f| manhattan_distance(opp.body[0], f))
+                    })
+                    .min()
+                    .unwrap_or(999);
+
+                // If we have 3+ move advantage, treat as attractive
+                if nearest_opponent_dist >= nearest_food_dist + 3 {
+                    config.scores.survival_max_multiplier * 0.3
                 } else {
-                    // Low urgency: 1% of max
-                    config.scores.survival_max_multiplier * 0.01
+                    // Uncertain, damp heavily
+                    config.scores.survival_max_multiplier * 0.05
                 }
             } else {
-                1.0  // Normal: Food at distance 2 or food is guarded
+                // Distance 3+: Even more uncertain
+                let nearest_opponent_dist = active_snakes.iter()
+                    .filter_map(|&opp_idx| {
+                        if opp_idx == snake_idx || opp_idx >= board.snakes.len() {
+                            return None;
+                        }
+                        let opp = &board.snakes[opp_idx];
+                        if opp.health <= 0 || opp.body.is_empty() {
+                            return None;
+                        }
+                        nearest_food.map(|f| manhattan_distance(opp.body[0], f))
+                    })
+                    .min()
+                    .unwrap_or(999);
+
+                // Large advantage needed for distant food
+                if nearest_opponent_dist >= nearest_food_dist + 4 {
+                    config.scores.survival_max_multiplier * 0.1
+                } else {
+                    // Very uncertain, minimal multiplier
+                    1.0
+                }
             };
 
             // Check escape routes after eating this food
