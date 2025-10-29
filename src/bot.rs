@@ -471,6 +471,24 @@ impl KillerMoveTable {
             depth_killers.fill(None);
         }
     }
+
+    /// V11: Age killers across iterations instead of clearing
+    /// Shifts all killers down by one depth level, discarding deepest killers
+    /// This allows recent killers to persist and improve move ordering
+    pub fn age_killers(&mut self) {
+        // Shift each depth's killers to the next depth
+        // depth[0] <- depth[1], depth[1] <- depth[2], etc.
+        // This effectively "ages" killers as we go deeper
+        if self.killers.len() > 1 {
+            for i in 0..self.killers.len() - 1 {
+                self.killers[i] = self.killers[i + 1].clone();
+            }
+            // Clear the deepest level (will be repopulated)
+            if let Some(last) = self.killers.last_mut() {
+                last.fill(None);
+            }
+        }
+    }
 }
 
 /// History Heuristic Table for move ordering
@@ -546,6 +564,17 @@ impl HistoryTable {
     pub fn clear(&mut self) {
         for scores in &mut self.scores {
             scores.fill(0);
+        }
+    }
+
+    /// V11: Decay history scores instead of clearing
+    /// Multiplies all scores by decay_factor (e.g., 0.9 = keep 90% of previous knowledge)
+    /// This allows successful move patterns to persist while gradually forgetting old info
+    pub fn decay_history(&mut self, decay_factor: f32) {
+        for scores in &mut self.scores {
+            for score in scores.iter_mut() {
+                *score = (*score as f32 * decay_factor) as i32;
+            }
         }
     }
 }
@@ -973,9 +1002,11 @@ impl Bot {
             );
             shared.current_depth.store(current_depth, Ordering::Release);
 
-            // Clear killers and history from previous iteration
-            killers.clear();
-            history.clear();
+            // V11: Age killers and decay history instead of clearing
+            // This preserves valuable move ordering information across iterations
+            // Decay factor 0.9 = keep 90% of previous knowledge
+            killers.age_killers();
+            history.decay_history(0.9);
 
             // Record iteration start time
             let iteration_start = Instant::now();
@@ -1900,20 +1931,50 @@ impl Bot {
                 false
             };
 
+            // V11: Growth-aware food urgency
+            // Check if we're shorter than opponents - if so, be MORE aggressive about food
+            let growth_multiplier = {
+                let min_opp_length = active_snakes
+                    .iter()
+                    .filter_map(|&idx| {
+                        if idx == snake_idx || idx >= board.snakes.len() {
+                            return None;
+                        }
+                        let s = &board.snakes[idx];
+                        if s.health > 0 {
+                            Some(s.length as i32)
+                        } else {
+                            None
+                        }
+                    })
+                    .min()
+                    .unwrap_or(100);
+
+                let our_length = snake.length as i32;
+                if our_length < min_opp_length {
+                    // We're shorter - boost food urgency to close the gap
+                    let gap = min_opp_length - our_length;
+                    1.0 + (gap as f32 * 0.2).min(1.0) // +20% per length behind, cap at 2x
+                } else {
+                    1.0 // Normal urgency
+                }
+            };
+
             // V8: Hierarchical urgency multiplier with configurable cap
             // Prevents unlimited multipliers from dominating ALL other factors
             // survival_max_multiplier (default 1000.0) ensures survival layer dominates tactical,
             // but safety vetoes can still block dangerous moves
             // V8.1: Apply max multiplier when we just ate food (health==100) to reward acquisition
             // V9.1: Distance-based damping with opponent awareness
+            // V11: Apply growth_multiplier to all urgency calculations
             let urgency_multiplier = if just_ate_food {
                 // Just ate food - strongly reward this state!
-                config.scores.survival_max_multiplier
+                config.scores.survival_max_multiplier * growth_multiplier
             } else if nearest_food_dist == 1 {
                 // Adjacent food - ALWAYS use max multiplier for distance-1 food
                 // The cycling bug was caused by not valuing adjacent food highly enough
                 // Even at high health, eating safe adjacent food should be strongly preferred
-                config.scores.survival_max_multiplier
+                config.scores.survival_max_multiplier * growth_multiplier
             } else if nearest_food_dist == 2 {
                 // Distance 2: Check if we have clear advantage
                 let nearest_opponent_dist = active_snakes.iter()
@@ -1931,34 +1992,35 @@ impl Bot {
                     .unwrap_or(999);
 
                 // V10.1: More aggressive at all health levels to prevent early game disadvantage
+                // V11: Apply growth_multiplier to all distance-2 cases
                 if snake.health < 30 {
                     // Critical health (<30): ALWAYS use max multiplier for distance-2 food
-                    config.scores.survival_max_multiplier
+                    config.scores.survival_max_multiplier * growth_multiplier
                 } else if snake.health < 50 {
                     // Low health (30-50): Use max multiplier only if clear advantage
                     if nearest_opponent_dist >= nearest_food_dist + 3 {
-                        config.scores.survival_max_multiplier
+                        config.scores.survival_max_multiplier * growth_multiplier
                     } else {
                         // Moderate multiplier when contested
-                        config.scores.survival_max_multiplier * 0.6
+                        config.scores.survival_max_multiplier * 0.6 * growth_multiplier
                     }
                 } else if snake.health < 70 {
                     // Moderate health (50-70): More aggressive to maintain size advantage
                     if nearest_opponent_dist >= nearest_food_dist + 2 {
                         // 2+ move advantage: good multiplier
-                        config.scores.survival_max_multiplier * 0.6
+                        config.scores.survival_max_multiplier * 0.6 * growth_multiplier
                     } else {
                         // Contested: conservative
-                        config.scores.survival_max_multiplier * 0.2
+                        config.scores.survival_max_multiplier * 0.2 * growth_multiplier
                     }
                 } else {
                     // High health (>70): Early game growth priority
                     if nearest_opponent_dist >= nearest_food_dist + 2 {
                         // 2+ move advantage: prioritize growth (lowered from 3+ requirement)
-                        config.scores.survival_max_multiplier * 0.8
+                        config.scores.survival_max_multiplier * 0.8 * growth_multiplier
                     } else {
                         // Contested: still pursue with modest multiplier (increased from 0.2)
-                        config.scores.survival_max_multiplier * 0.3
+                        config.scores.survival_max_multiplier * 0.3 * growth_multiplier
                     }
                 }
             } else {
@@ -1978,31 +2040,32 @@ impl Bot {
                     .unwrap_or(999);
 
                 // V10.1: Increased multipliers for distant food, especially early game
+                // V11: Apply growth_multiplier to all distance 3+ cases
                 // At critical health (<30), pursue any nearby food
                 if snake.health < 30 && nearest_food_dist <= 4 {
                     // Desperate: pursue distance 3-4 food at critical health
-                    config.scores.survival_max_multiplier * 0.5
+                    config.scores.survival_max_multiplier * 0.5 * growth_multiplier
                 } else if snake.health > 70 {
                     // Early game (high health): prioritize growth even for distant food
                     if nearest_opponent_dist >= nearest_food_dist + 3 {
                         // Clear 3+ advantage: strong multiplier for growth
-                        config.scores.survival_max_multiplier * 0.5
+                        config.scores.survival_max_multiplier * 0.5 * growth_multiplier
                     } else if nearest_opponent_dist >= nearest_food_dist + 2 {
                         // Small 2+ advantage: moderate multiplier
-                        config.scores.survival_max_multiplier * 0.2
+                        config.scores.survival_max_multiplier * 0.2 * growth_multiplier
                     } else {
-                        // Contested: minimal multiplier
-                        1.0
+                        // Contested: minimal multiplier (still apply growth boost)
+                        1.0 * growth_multiplier
                     }
                 } else if nearest_opponent_dist >= nearest_food_dist + 4 {
                     // Clear 4+ move advantage: use moderate multiplier
-                    config.scores.survival_max_multiplier * 0.4
+                    config.scores.survival_max_multiplier * 0.4 * growth_multiplier
                 } else if nearest_opponent_dist >= nearest_food_dist + 2 {
                     // Small 2+ move advantage: use low multiplier
-                    config.scores.survival_max_multiplier * 0.1
+                    config.scores.survival_max_multiplier * 0.1 * growth_multiplier
                 } else {
-                    // Contested or no advantage: minimal multiplier
-                    1.0
+                    // Contested or no advantage: minimal multiplier (still apply growth boost)
+                    1.0 * growth_multiplier
                 }
             };
 

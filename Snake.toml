@@ -1,5 +1,13 @@
-# Battlesnake Configuration File
+# Battlesnake Configuration File - V11
 # All tunable parameters for the MaxN algorithm implementation
+#
+# V11 Changes:
+# - Reduced immediate_food_bonus from 500K to 15K (33x reduction)
+# - Reduced survival_max_multiplier from 1000 to 200 (5x reduction)
+# - Fixed evaluation function over-tuning that created 37.5B food scores
+# - Now: 15K * 200x * 40 weight = 120M (dominant but balanced with safety)
+# - Rebalanced component weights: space 15.0, health 40.0, control 5.0, attack 8.0
+# - Persistent killer/history tables: age/decay instead of clear (better move ordering)
 
 # ============================================================================
 # Timing & Performance Constants
@@ -114,7 +122,9 @@ temporal_discount_factor = 0.95
 # V8: Hierarchical Evaluation System
 # Separates safety vetoes, survival needs, tactical play, and strategic positioning
 # Prevents single components from dominating decision-making
-survival_max_multiplier = 1000.0     # Cap urgency multiplier (not unlimited)
+# V11: Reduced from 1000.0 to 200.0 - with new 15K food bonus, 200x multiplier
+# creates 3M raw score, weighted 75x = 225M (dominant but allows safety vetoes)
+survival_max_multiplier = 200.0     # Cap urgency multiplier (not unlimited)
 survival_health_threshold = 20       # Health level to activate survival mode
 
 # V8: Growth Strategy
@@ -135,20 +145,26 @@ score_survival_weight = 1000.0
 # Reduced from 30.0 to 25.0 to better balance with food acquisition
 # V4 analysis showed wall/space penalties overwhelming food needs at edges
 # At 25.0: balanced with health weight for better decision-making
-weight_space = 25.0
+# V11: Reduced from 25.0 to 15.0 - with lower food bonuses, need lower space weight
+# to avoid defensive play. Space is important but shouldn't overwhelm tactical needs.
+weight_space = 20.0
 # Weight for health/food score
 # Increased from 50.0 to 75.0 based on v4 food acquisition bug
 # V4 game_02 turn 17: adjacent food ignored due to wall/space penalties
 # At 75.0: food acquisition dominates when health < 50, allowing edge feeding
-weight_health = 75.0
+# V11: Reduced from 75.0 to 40.0 - with lower food bonuses, need proportional reduction
+# to maintain balance. Food is critical but not at expense of survival.
+weight_health = 40.0
 # Weight for territory control score
-weight_control = 3.0
+# V11: Increased from 3.0 to 5.0 to encourage strategic positioning
+weight_control = 5.0
 # Weight for attack potential score
 # Increased from 2.0 to 10.0 to make kill opportunities competitive with space control
 # Analysis: attack bonuses of +500 (head-to-head + trap) need 10x multiplier to overcome
 # space control differences (space_delta × 20.0). At 10.0, trapped opponent scenarios
 # generate +5000 attack score, dominating defensive space gains.
-weight_attack = 10.0
+# V11: Reduced from 10.0 to 8.0 to be more selective about aggression
+weight_attack = 8.0
 # Weight per unit of snake length
 weight_length = 100
 
@@ -168,7 +184,10 @@ health_threat_distance = 3
 # V6 analysis: Game 05 died turn 25 from avoiding safe center food at distance 2
 # Extended from distance 1 to 2 to apply bonus for nearby food (not just adjacent)
 # V9.1.1: MASSIVELY increased to 500K to overcome any other penalties
-immediate_food_bonus = 500000
+# V11: Reduced from 500K to 15K - previous value with 1000x multiplier created
+# 37.5B scores that overwhelmed ALL other factors (survival, space, traps)
+# At 15K with max multiplier 1000x = 15M, weighted 75x = 1.125B (still dominant but balanced)
+immediate_food_bonus = 100000  # V11.2: Increased from 75000 to eliminate last cycling event
 immediate_food_distance = 2
 
 # Space Control Constants
@@ -206,7 +225,7 @@ head_collision_penalty = -50000
 # Examples (at 500): distance=0 → -500, distance=1 → -250, distance=2 → -167, distance≥3 → 0
 # Reduced from 1000 to 500 to allow food acquisition near walls when health demands it
 # V4 analysis: wall penalty was preventing adjacent food consumption at board edges
-wall_penalty_base = 500              # Base penalty value (divided by distance + 1)
+wall_penalty_base = 750              # Base penalty value (divided by distance + 1)
 safe_distance_from_wall = 3          # Distance at which wall penalty becomes 0
 
 # Center Bias
@@ -359,7 +378,7 @@ terminal_state_threshold = 1
 # Enable debug mode to log game states, moves, and turns to disk
 enabled = true
 # Path to debug log file (relative to working directory)
-log_file_path = "optimized_v10.1.jsonl"
+log_file_path = "tournament.jsonl"
 
 # ============================================================================
 # Performance Profiling Configuration

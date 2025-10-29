@@ -315,25 +315,25 @@ impl Config {
             },
             scores: ScoresConfig {
                 temporal_discount_factor: 0.95,
-                survival_max_multiplier: 1000.0,
+                survival_max_multiplier: 200.0,  // V11: Reduced from 1000.0
                 survival_health_threshold: 20,
                 growth_urgency_per_length: 500,
                 growth_bonus_when_ahead: 100,
                 score_dead_snake: i32::MIN + 1000,
                 score_survival_penalty: -1_000_000,
                 score_survival_weight: 1000.0,
-                weight_space: 25.0,  // Reduced from 30.0 to balance food acquisition
-                weight_health: 75.0,  // Increased from 50.0 for better food seeking
-                weight_control: 3.0,
-                weight_attack: 10.0,  // Increased from 2.0 for aggressive play
+                weight_space: 15.0,  // V11: Reduced from 25.0 for balanced play
+                weight_health: 40.0,  // V11: Reduced from 75.0 to match lower food bonuses
+                weight_control: 5.0,  // V11: Increased from 3.0 for strategic positioning
+                weight_attack: 8.0,  // V11: Reduced from 10.0 for selective aggression
                 weight_length: 100,
                 score_zero_health: -100_000,
                 default_food_distance: 999,
                 health_max: 100.0,
                 score_starvation_base: -50_000,
                 health_threat_distance: 3,
-                immediate_food_bonus: 5000,
-                immediate_food_distance: 1,
+                immediate_food_bonus: 100000,  // V11.2: Increased from 75000 (eliminate last cycle)
+                immediate_food_distance: 2,
                 space_safety_margin: 5,
                 space_shortage_penalty: 100,
                 // Length-aware health constants
