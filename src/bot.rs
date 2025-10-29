@@ -1838,11 +1838,17 @@ impl Bot {
             .min()
             .unwrap_or(config.scores.default_food_distance);
 
+        // V8.1 CRITICAL FIX: Reward states where we JUST ATE food (health==100)
+        // Previous bug: Only rewarded being ADJACENT to food, not EATING it
+        // Result: Search tree never saw value in moves that acquire food
+        let just_ate_food = snake.health == 100;
+
         // Immediate food bonus: strongly incentivize grabbing adjacent food
         // This overrides normal distance penalty to ensure we eat when safe
         // V6 fix: Check escape routes before eating food to avoid "grab and die" pattern
         // V7.1 fix: Add urgency multiplier for distance-1 food when health is low
-        if nearest_food_dist <= config.scores.immediate_food_distance && snake.health < 100 {
+        // V8.1 fix: Also apply bonus when we just ate food (health==100)
+        if (nearest_food_dist <= config.scores.immediate_food_distance && snake.health < 100) || just_ate_food {
             // Find the nearest food position
             let nearest_food = board
                 .food
@@ -1861,7 +1867,11 @@ impl Bot {
             // Prevents unlimited multipliers from dominating ALL other factors
             // survival_max_multiplier (default 1000.0) ensures survival layer dominates tactical,
             // but safety vetoes can still block dangerous moves
-            let urgency_multiplier = if nearest_food_dist == 1 && is_food_safe {
+            // V8.1: Apply max multiplier when we just ate food (health==100) to reward acquisition
+            let urgency_multiplier = if just_ate_food {
+                // Just ate food - strongly reward this state!
+                config.scores.survival_max_multiplier
+            } else if nearest_food_dist == 1 && is_food_safe {
                 // Adjacent safe food - use urgency based on health threshold
                 if snake.health < config.scores.survival_health_threshold as i32 {
                     // CRITICAL survival mode: max multiplier

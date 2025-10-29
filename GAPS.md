@@ -1,7 +1,34 @@
 ## Version History
 
-### V8 (Current) - Hierarchical Evaluation & Smart Food Safety
+### V8.1 (Current) - Critical Food Acquisition Fix
 **Status:** COMPLETED - January 2025
+**Key Fix:**
+- ✅ **CRITICAL BUG FIX**: immediate_food_bonus now triggers when food is EATEN, not just when adjacent
+- ✅ Previous bug: Search tree never saw value in moves that acquire food (health==100 states were excluded)
+- ✅ New logic: Apply max multiplier (1000x) to states where we just ate food (health==100)
+- ✅ Result: Food-eating moves now get +375M score bonus (5000 × 1000 × 75), making them highly attractive
+
+**Root Cause Analysis:**
+- V8 only applied immediate_food_bonus when `snake.health < 100 && adjacent to food`
+- When evaluating moves that EAT food, resulting state has health==100, so bonus was skipped
+- Search tree evaluated food moves with NORMAL scoring, not the massive urgency multipliers
+- Other factors (space, positioning) dominated decisions, causing persistent food avoidance
+
+**Fix Implementation:**
+- Added `just_ate_food = snake.health == 100` detection (src/bot.rs:1844)
+- Modified bonus condition to include `|| just_ate_food` (src/bot.rs:1851)
+- Apply max urgency_multiplier (1000x) when `just_ate_food` (src/bot.rs:1871-1873)
+- States with health==100 now get +375M bonus, ensuring food acquisition is valued
+
+**Expected Results:**
+- Food avoidance: Target <5% (from V8's 14%)
+- Food acquisition becomes dominant factor in decision-making
+- Bot should aggressively pursue safe food even at moderate health levels
+
+---
+
+### V8 - Hierarchical Evaluation & Smart Food Safety
+**Status:** PARTIAL - Food avoidance persisted at 14% due to bonus timing bug
 **Key Features:**
 - ✅ Implemented smart food safety check (is_food_actually_safe) - predicts post-eating traps
 - ✅ Added hierarchical evaluation with capped urgency multipliers (max 1000x instead of unlimited)
